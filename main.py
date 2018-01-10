@@ -53,6 +53,10 @@ parser.add_argument('--baseline', type=str, default="none",
                     help='baseline to use (default: none)')
 parser.add_argument('--log-file', type=str, default=None,
                     help='log file to write to (default: None)')
+parser.add_argument('--v-optimizer', type=str, default='lbfgs',
+                    help='which optimizer to use for the value function (default: lbfgs)')
+parser.add_argument('--use-disc-avg-v', action='store_true',
+                    help='use discounted average value parameterization of the value function (default: False)')
 args = parser.parse_args()
 
 env = gym.make(args.env_name)
@@ -65,7 +69,11 @@ torch.manual_seed(args.seed)
 
 policy_net = Policy(num_inputs, num_actions)
 value_net = Value(num_inputs)
+value_optim = torch.optim.Adam(value_net.parameters(),
+                               lr=args.control_variate_lr)
+
 disc_avg_value_net = Value(num_inputs)
+
 control_variate_net = Value(num_inputs)
 control_variate_optim = torch.optim.Adam(control_variate_net.parameters(),
                                    lr=args.control_variate_lr)
@@ -76,7 +84,7 @@ advantage_optim = torch.optim.Adam(advantage_net.parameters(),
 # 1 step environment model
 env_net = EnvModel(num_inputs + num_actions, num_inputs)
 env_optim = torch.optim.Adam(env_net.parameters(),
-                             lr=args.control_variate_lr)
+                             lr=args.control_variate_lr/3)
 
 def select_action(state):
     state = torch.from_numpy(state).unsqueeze(0)
@@ -85,6 +93,12 @@ def select_action(state):
                                     torch.ones(action_std.size())))
     action = action_mean + epsilon * action_std
     return action, epsilon
+
+def compute_values(value_net, states, discounted_time_left, use_disc_avg_v=False):
+  if use_disc_avg_v:
+    return discounted_time_left * value_net(states)
+  else:
+    return value_net(states)
 
 def update_params(batch):
     logging_info = {}
@@ -95,11 +109,9 @@ def update_params(batch):
     states = torch.Tensor(batch.state)
     time_left = args.max_time - torch.Tensor(batch.time)
     discounted_time_left = Variable((1 - torch.pow(args.gamma, time_left+1))/(1 - args.gamma)).view(-1, 1)
-    values = value_net(Variable(states))
-    disc_avg_values = discounted_time_left * disc_avg_value_net(Variable(states))
 
-    #ipdb.set_trace()
-
+    # Compute values and control variates
+    values = compute_values(value_net, Variable(states), discounted_time_left, args.use_disc_avg_v)
     control_variates = control_variate_net(Variable(states))
     advantage_estimator = advantage_net(Variable(torch.cat(
         (states, actions), dim=1)))
@@ -113,11 +125,11 @@ def update_params(batch):
     prev_advantage = 0
     for i in reversed(range(rewards.size(0))):
         returns[i] = rewards[i] + args.gamma * prev_return * masks[i]
-        deltas[i] = rewards[i] + args.gamma * prev_value * masks[i] - disc_avg_values.data[i]
+        deltas[i] = rewards[i] + args.gamma * prev_value * masks[i] - values.data[i]
         advantages[i] = deltas[i] + args.gamma * args.tau * prev_advantage * masks[i]
 
         prev_return = returns[i, 0]
-        prev_value = disc_avg_values.data[i, 0]
+        prev_value = values.data[i, 0]
         prev_advantage = advantages[i, 0]
 
     targets = Variable(returns)
@@ -130,7 +142,7 @@ def update_params(batch):
             if param.grad is not None:
                 param.grad.data.fill_(0)
 
-        values_ = value_net(Variable(states))
+        values_ = compute_values(value_net, Variable(states), discounted_time_left, args.use_disc_avg_v)
 
         value_loss = (values_ -  targets).pow(2).mean()
 
@@ -140,37 +152,20 @@ def update_params(batch):
         value_loss.backward()
         return (value_loss.data.double().numpy()[0], get_flat_grad_from(value_net).data.double().numpy())
 
-    def get_disc_avg_value_loss(flat_params):
-        set_flat_params_to(disc_avg_value_net, torch.Tensor(flat_params))
-        for param in disc_avg_value_net.parameters():
-            if param.grad is not None:
-                param.grad.data.fill_(0)
-
-        values_ = discounted_time_left * disc_avg_value_net(Variable(states))
-
-        value_loss = (values_ -  targets).pow(2).mean()
-
-        # weight decay
-        for param in disc_avg_value_net.parameters():
-            value_loss += param.pow(2).sum() * args.l2_reg
-        value_loss.backward()
-        return (value_loss.data.double().numpy()[0], get_flat_grad_from(disc_avg_value_net).data.double().numpy())
-
     #
     # Print debugging values
     #
     print('Mean advantages: %g' % (advantages.mean()))
     print('MSE returns: %g' % (returns.pow(2).mean()))
     print('MSE returns - values: %g' % ((returns - values.data).pow(2).mean()))
-    print('MSE returns - disc_avg_values: %g' % ((returns - disc_avg_values.data).pow(2).mean()))
     print('MSE advantages: %g' % (advantages.pow(2).mean()))
-    print('MSE CV advantages: %g' % ((returns - control_variates.data).pow(2).mean()))
-    print('MSE advantages - estimator: %g' % ((returns - advantage_estimator.data).pow(2).mean()))
+    print('MSE state baseline advantages: %g' % ((advantages - control_variates.data).pow(2).mean()))
+    print('MSE state-action baseline advantages: %g' % ((advantages - advantage_estimator.data).pow(2).mean()))
 
     logging_info['mse_v_lbfgs'] = (returns - values.data).pow(2).mean()
     logging_info['mse_none'] = advantages.pow(2).mean()
-    logging_info['mse_v'] = (returns - control_variates.data).pow(2).mean()
-    logging_info['mse_q'] = (returns - advantage_estimator.data).pow(2).mean()
+    logging_info['mse_v'] = (advantages - control_variates.data).pow(2).mean()
+    logging_info['mse_q'] = (advantages - advantage_estimator.data).pow(2).mean()
 
     # Disable normalization of advantages
     # advantages = (advantages - advantages.mean()) / advantages.std()
@@ -181,7 +176,8 @@ def update_params(batch):
     reward_hat, next_obs_delta_hat = env_net(Variable(torch.cat(
         (states, actions), dim=1)))
     next_obs_hat = Variable(states) + next_obs_delta_hat
-    next_value_hat = value_net(next_obs_hat)
+    # TODO: Fix time for 1 step in the future!
+    next_value_hat = compute_values(value_net, next_obs_hat, discounted_time_left, args.use_disc_avg_v)
     disc_sum_reward_hat = reward_hat + args.gamma * next_value_hat
 
     def get_loss(volatile=False, baseline="none"):
@@ -233,28 +229,39 @@ def update_params(batch):
       print("%s grad MSE: %g" % (baseline, loss_grad_mse))
 
     # Update control variates
-    detached_values = disc_avg_values.detach()
+
+    # state only baseline
+    detached_values = values.detach()
     control_variate_loss_mse = None
     control_variate_epochs = 25  # fixed for now, change LR to change learning dynamics
     for _ in range(control_variate_epochs):
       control_variates = control_variate_net(Variable(states))
       control_variate_optim.zero_grad()
-      #control_variate_loss = (control_variates - control_variate_targets).pow(2).mean()
-      control_variate_loss = (targets - control_variates).pow(2).mean()
+      control_variate_loss = (control_variate_targets - control_variates).pow(2).mean()
+      #control_variate_loss = (targets - control_variates).pow(2).mean()
       control_variate_loss.backward()
       control_variate_optim.step()
 
-      if control_variate_loss_mse is None:
-        control_variate_loss_mse = control_variate_loss.data.numpy()
-      #print('State baseline MSE: %g' % control_variate_loss.data.numpy())
+    # state-action baseline
+    advantage_net_loss_mse = None
+    for _ in range(control_variate_epochs):
+      advantage_estimator = advantage_net(Variable(torch.cat(
+        (states, actions), dim=1)))
+      advantage_optim.zero_grad()
+      #advantage_net_loss = (targets - detached_values - advantage_estimator).pow(2).mean()
+      advantage_net_loss = (control_variate_targets - advantage_estimator).pow(2).mean()
+      #advantage_net_loss = (targets - advantage_estimator).pow(2).mean()
+      advantage_net_loss.backward()
+      advantage_optim.step()
 
-
+    # 1-step model baseline
     env_net_loss_mse = None
     for _ in range(control_variate_epochs):
       reward_hat, next_obs_delta_hat = env_net(Variable(torch.cat(
         (states, actions), dim=1)))
       next_obs_hat = Variable(states) + next_obs_delta_hat
-      next_value_hat = discounted_time_left * disc_avg_value_net(next_obs_hat)
+      # TODO: Fix discounted time left to account for 1 time step in the future!
+      next_value_hat = compute_values(value_net, next_obs_hat, discounted_time_left, args.use_disc_avg_v)
       disc_sum_reward_hat = reward_hat + args.gamma * next_value_hat
 
       env_optim.zero_grad()
@@ -269,33 +276,23 @@ def update_params(batch):
         print('Env net MSE: %g' % env_net_loss_mse)
         logging_info['mse_model'] = env_net_loss_mse[0]
 
-        #ipdb.set_trace()
-
-    advantage_net_loss_mse = None
-    for _ in range(control_variate_epochs):
-      advantage_estimator = advantage_net(Variable(torch.cat(
-        (states, actions), dim=1)))
-      advantage_optim.zero_grad()
-      #advantage_net_loss = (targets - detached_values - advantage_estimator).pow(2).mean()
-      #advantage_net_loss = (control_variate_targets - advantage_estimator).pow(2).mean()
-      advantage_net_loss = (targets - advantage_estimator).pow(2).mean()
-      advantage_net_loss.backward()
-      advantage_optim.step()
-
-      if advantage_net_loss_mse is None:
-        advantage_net_loss_mse = advantage_net_loss.data.numpy()
-      #print('Action-state baseline MSE: %g' % advantage_net_loss.data.numpy())
 
     # Update value function
-    flat_params, _, opt_info = scipy.optimize.fmin_l_bfgs_b(get_value_loss, get_flat_params_from(value_net).double().numpy(), maxiter=25)
-    set_flat_params_to(value_net, torch.Tensor(flat_params))
+    if args.v_optimizer == 'lbfgs':
+      flat_params, _, opt_info = scipy.optimize.fmin_l_bfgs_b(get_value_loss, get_flat_params_from(value_net).double().numpy(), maxiter=25)
+      set_flat_params_to(value_net, torch.Tensor(flat_params))
+    elif args.v_optimizer == 'adam':
+      for _ in range(control_variate_epochs):
+        new_values = compute_values(value_net, Variable(states), discounted_time_left, args.use_disc_avg_v)
+        value_optim.zero_grad()
+        value_loss = (targets - new_values).pow(2).mean()
+        value_loss.backward()
+        value_optim.step()
+    else:
+      exit()
 
-    flat_params, _, opt_info = scipy.optimize.fmin_l_bfgs_b(get_disc_avg_value_loss, get_flat_params_from(disc_avg_value_net).double().numpy(), maxiter=25)
-    set_flat_params_to(disc_avg_value_net, torch.Tensor(flat_params))
-
-
+    # Deprecated:
     # Update advantage net
-
     # Recompute advanatages w/ the new values
     #disc_avg_values = discounted_time_left * disc_avg_value_net(Variable(states))
     #prev_return = 0

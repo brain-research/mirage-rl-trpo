@@ -46,3 +46,24 @@ class Value(nn.Module):
 
         state_values = self.value_head(x)
         return state_values
+
+class EnvModel(nn.Module):
+    def __init__(self, num_inputs, num_outputs):
+        super(EnvModel, self).__init__()
+        self.affine1 = nn.Linear(num_inputs, 64)
+        self.affine2 = nn.Linear(64, 64)
+        self.env_model_head = nn.Linear(64, num_outputs)
+        self.env_model_head.weight.data.mul_(0.1)
+        self.env_model_head.bias.data.mul_(0.0)
+
+        self.reward_head = nn.Linear(64, 1)
+        self.reward_head.weight.data.mul_(0.1)
+        self.reward_head.bias.data.mul_(0.0)
+
+    def forward(self, x):
+        x = F.tanh(self.affine1(x))
+        x = F.tanh(self.affine2(x))
+
+        reward = self.reward_head(x)
+        next_obs = self.env_model_head(x)
+        return reward, next_obs

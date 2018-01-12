@@ -108,7 +108,7 @@ def update_params(batch):
     epsilons = torch.Tensor(np.concatenate(batch.epsilon, 0))
     states = torch.Tensor(batch.state)
     time_left = args.max_time - torch.Tensor(batch.time)
-    discounted_time_left = Variable((1 - torch.pow(args.gamma, time_left+1))/(1 - args.gamma)).view(-1, 1)
+    discounted_time_left = Variable((1 - torch.pow(args.gamma, time_left))/(1 - args.gamma)).view(-1, 1)
 
     # Compute values and control variates
     values = compute_values(value_net, Variable(states), discounted_time_left, args.use_disc_avg_v)
@@ -227,6 +227,7 @@ def update_params(batch):
       loss_grad_mse = torch.cat([grad.view(-1) for grad in grads]).data.pow(2).mean()
 
       print("%s grad MSE: %g" % (baseline, loss_grad_mse))
+      logging_info['grad_mse_%s' % baseline] = loss_grad_mse
 
     # Update control variates
 

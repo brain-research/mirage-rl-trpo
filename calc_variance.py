@@ -172,7 +172,7 @@ def estimate_variance(batch, g_mu_1, g_mu_2):
 
     # Select random state, compute gradient estimate for that state
     psi_vars = []
-    for _ in range(1000):
+    for _ in range(10):
       i = random.randint(0, rewards.size(0)-1)
 
       s = states[i, :].numpy()
@@ -184,28 +184,43 @@ def estimate_variance(batch, g_mu_1, g_mu_2):
 
       common_epsilons = [Variable(torch.normal(torch.zeros(epsilons.size()),
                                                torch.ones(epsilons.size()))) for _ in range(10)]
-      mu = 0
-      print('new state')
-      for _ in range(10):
-        a, _ = select_action(s)
-        a = a.data[0].numpy()
+
+      x = calc_advantage_estimator(mujoco_state, a, time_left, common_epsilons[0]) * grad_log_pi(s, a)
+      y = calc_advantage_estimator(mujoco_state, a, time_left, common_epsilons[1]) * grad_log_pi(s, a)
+
+      a, _ = select_action(s)
+      a = a.data[0].numpy()
+      w = calc_advantage_estimator(mujoco_state, a, time_left, common_epsilons[0]) * grad_log_pi(s, a)
+
+      a, _ = select_action(s)
+      a = a.data[0].numpy()
+      z = calc_advantage_estimator(mujoco_state, a, time_left, common_epsilons[1]) * grad_log_pi(s, a)
+
+      #print((np.mean(x*x), np.mean(x*y), np.mean(x*x - x*y)))
+      psi_vars.append((np.mean(x*x + y*y)/2, np.mean(x*y), np.mean(w*z)))
+      #print(psi_vars[-1])
+
+      #mu = 0
+      #print('new state')
+      #for _ in range(10):
+      #  a, _ = select_action(s)
+      #  a = a.data[0].numpy()
 
 
-        w = 0
-        for j in range(10):
-          w += calc_advantage_estimator(mujoco_state, a, time_left, common_epsilons[j])
-        w /= 10
-        w *= grad_log_pi(s, a)
-        mu += w
-        vecs.append(w)
+      #  w = 0
+      #  for j in range(10):
+      #    w += calc_advantage_estimator(mujoco_state, a, time_left, common_epsilons[j])
+      #  w /= 10
+      #  w *= grad_log_pi(s, a)
+      #  mu += w
+      #  vecs.append(w)
 
-      mu /= len(vecs)
-      psi_vars.append(np.mean([np.mean(np.square(vec - mu)) for vec in vecs]))
+      #mu /= len(vecs)
+      #psi_vars.append(np.mean([np.mean(np.square(vec - mu)) for vec in vecs]))
 
-      print(psi_vars[-1])
+      #print(psi_vars[-1])
 
-    ipdb.set_trace()
-    print(np.mean(psi_vars))
+    return np.mean(psi_vars, axis=0)
 
     """
     Need 4 rollouts, can reuse 1 rollout throughout
@@ -365,5 +380,5 @@ for i_episode in range(args.n_epochs):
   var_hat = estimate_variance(batch, vectorize(g_mu_1),
                     vectorize(g_mu_2))
 
-  #print(var_hat)
-
+  print(var_hat)
+  print(np.mean((vectorize(g_mu_1) * vectorize(g_mu_2)).data.numpy()))

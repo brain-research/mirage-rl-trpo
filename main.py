@@ -2,6 +2,7 @@ import argparse
 from itertools import count
 import functools
 
+import random
 import gym
 import scipy.optimize
 
@@ -16,6 +17,8 @@ from utils import *
 import ipdb
 import sys
 import json
+import os
+import pickle
 
 torch.utils.backcompat.broadcast_warning.enabled = True
 torch.utils.backcompat.keepdim_warning.enabled = True
@@ -57,6 +60,10 @@ parser.add_argument('--v-optimizer', type=str, default='lbfgs',
                     help='which optimizer to use for the value function (default: lbfgs)')
 parser.add_argument('--use-disc-avg-v', action='store_true',
                     help='use discounted average value parameterization of the value function (default: False)')
+parser.add_argument('--checkpoint-dir', type=str, default=None,
+                    help='directory to write checkpoints to (default: None)')
+parser.add_argument('--checkpoint-interval', type=int, default=5, metavar='N',
+                    help='interval between saving model checkpoints (default: 5)')
 args = parser.parse_args()
 
 env = gym.make(args.env_name)
@@ -71,8 +78,6 @@ policy_net = Policy(num_inputs, num_actions)
 value_net = Value(num_inputs)
 value_optim = torch.optim.Adam(value_net.parameters(),
                                lr=args.control_variate_lr)
-
-disc_avg_value_net = Value(num_inputs)
 
 control_variate_net = Value(num_inputs)
 control_variate_optim = torch.optim.Adam(control_variate_net.parameters(),
@@ -357,9 +362,6 @@ for i_episode in range(args.n_epochs):
     reward_batch /= num_episodes
     batch = memory.sample()
 
-    #if i_episode > 60:
-    #  ipdb.set_trace()
-
     logging_info = update_params(batch)
 
     if i_episode % args.log_interval == 0:
@@ -370,8 +372,26 @@ for i_episode in range(args.n_epochs):
         logging_info['reward_sum'] = reward_sum
         logging_info['reward_batch'] = reward_batch
         log_file.write('%s\n' % json.dumps(logging_info))
-        #'%d\t%g\t%g\n' % (i_episode, reward_sum, reward_batch))
         log_file.flush()
+
+    if args.checkpoint_dir is not None and i_episode % args.checkpoint_interval == 0:
+      print('Saving checkpoint')
+      nets = [('policy', policy_net),
+              ('value', value_net),
+              ('v', control_variate_net),
+              ('q', advantage_net),
+              ('env', env_net), ]
+      for (net_name, net) in nets:
+        torch.save(net.state_dict(), os.path.join(args.checkpoint_dir, '%s_%d.chkpt' % (net_name, i_episode)))
+      with open(os.path.join(args.checkpoint_dir, 'zfilter_%d.p' % i_episode), 'wb') as out:
+        pickle.dump(running_state, out)
+
+      # Save args on first episode
+      if i_episode == 0:
+        with open(os.path.join(args.checkpoint_dir, 'training_args.p'), 'wb') as out:
+          pickle.dump(args, out)
+
+
 
 if args.log_file is not None:
   log_file.close()

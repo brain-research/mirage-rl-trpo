@@ -148,7 +148,7 @@ def grad_log_pi(state, action):
 
 
 
-def estimate_variance(batch, n_samples=50):
+def estimate_variance(batch, n_samples=10):
   """
   Need 4 rollouts, can reuse 1 rollout throughout
 
@@ -188,11 +188,15 @@ def estimate_variance(batch, n_samples=50):
 #    common_epsilons = [Variable(torch.normal(torch.zeros(epsilons.size()),
 #                                             torch.ones(epsilons.size()))) for _ in range(10)]
 
+    value_func_est = control_variate_net(Variable(torch.Tensor(s))).data.numpy()[0]
+
     shared_grad_log_pi = grad_log_pi(s, a)
     sq_shared_grad_log_pi = shared_grad_log_pi * shared_grad_log_pi
 
     q_x = calc_advantage_estimator(mujoco_state, a, time_left)
     q_y = calc_advantage_estimator(mujoco_state, a, time_left)
+
+    q_func_est = advantage_net(Variable(torch.cat([torch.Tensor(s), torch.Tensor(a)]))).data.numpy()[0]
 
     # Calculation value function estimates
     a, _ = select_action(s)
@@ -208,16 +212,49 @@ def estimate_variance(batch, n_samples=50):
     q = calc_advantage_estimator(mujoco_state, a, time_left)
     unshared_grad_log_pi = grad_log_pi(s, a)
 
-    full_grad_var = np.mean(q_x*q_x*sq_shared_grad_log_pi + q_y*q_y*sq_shared_grad_log_pi)/2
-    shared_sq_term = -np.mean((q_x - v_x)*(q - v_y)*shared_grad_log_pi * unshared_grad_log_pi +
-                              (q - v_x)*(q_y - v_y)*shared_grad_log_pi * unshared_grad_log_pi)/2
-    no_baseline_conditional_var = np.mean(q_x*q_y*sq_shared_grad_log_pi) + shared_sq_term
-    value_baseline_conditional_var = np.mean((q_x - v_x)*(q_y - v_y)*sq_shared_grad_log_pi) + shared_sq_term
+    q_func_est_prime = advantage_net(Variable(torch.cat([torch.Tensor(s), torch.Tensor(a)]))).data.numpy()[0]
 
-    variance_hats.append((full_grad_var,
-                          no_baseline_conditional_var,
-                          value_baseline_conditional_var,
+    term_1 = np.mean(q_x*q_x*sq_shared_grad_log_pi + q_y*q_y*sq_shared_grad_log_pi)/2
+    term_2 = np.mean(q_x*q_y*sq_shared_grad_log_pi)
+    term_2_value_baseline = np.mean((q_x - v_x)*(q_y - v_y)*sq_shared_grad_log_pi)
+    term_2_value_func_est_baseline = np.mean((q_x - value_func_est)*
+                                             (q_y - value_func_est)*
+                                             sq_shared_grad_log_pi)
+    term_2_q_func_est_baseline = np.mean((q_x - q_func_est)*
+                                         (q_y - q_func_est)*
+                                         sq_shared_grad_log_pi)
+
+    # Might as well use the value estimates to reduce the variance of this term
+    term_3 = np.mean((q_x - v_x)*(q - v_y)*shared_grad_log_pi * unshared_grad_log_pi +
+                     (q - v_x)*(q_y - v_y)*shared_grad_log_pi * unshared_grad_log_pi)/2
+    term_3_q_func_est_baseline = np.mean((q_x - q_func_est)*(q - q_func_est_prime)*shared_grad_log_pi * unshared_grad_log_pi +
+                                         (q - q_func_est_prime)*(q_y - q_func_est)*shared_grad_log_pi * unshared_grad_log_pi)/2
+
+    var_term_1 = term_1 - term_2
+    var_term_2 = term_2 - term_3
+    var_term_2_value_func_est_baseline = term_2_value_func_est_baseline - term_3
+    var_term_2_q_func_est_baseline = term_2_q_func_est_baseline - term_3_q_func_est_baseline
+    var_term_2_value_baseline = term_2_value_baseline - term_3
+    var_term_3 = term_3 # - E[g]^2 which is small, so this is an upper bound
+
+    variance_hats.append((var_term_1,
+                          var_term_2,
+                          var_term_2_value_func_est_baseline,
+                          var_term_2_q_func_est_baseline,
+                          var_term_2_value_baseline,
+                          var_term_3,
                           ))
+
+    #full_grad_var = np.mean(q_x*q_x*sq_shared_grad_log_pi + q_y*q_y*sq_shared_grad_log_pi)/2
+    #shared_sq_term = -np.mean((q_x - v_x)*(q - v_y)*shared_grad_log_pi * unshared_grad_log_pi +
+    #                          (q - v_x)*(q_y - v_y)*shared_grad_log_pi * unshared_grad_log_pi)/2
+    #no_baseline_conditional_var = np.mean(q_x*q_y*sq_shared_grad_log_pi) + shared_sq_term
+    #value_baseline_conditional_var = np.mean((q_x - v_x)*(q_y - v_y)*sq_shared_grad_log_pi) + shared_sq_term
+
+    #variance_hats.append((full_grad_var,
+    #                      no_baseline_conditional_var,
+    #                      value_baseline_conditional_var,
+    #                      ))
 
     ## Use shared action for x, y
     #x = calc_advantage_estimator(mujoco_state, a, time_left) * grad_log_pi(s, a)
@@ -290,8 +327,8 @@ def calc_advantage_estimator(mujoco_state, action, time_left, epsilons=None):
     prev_value = values.data[i].numpy()[0]
     prev_advantage = advantages[i]
 
-  #return advantages[0], returns[0]
-  return returns[0]
+  return advantages[0]
+  #return returns[0]
 
 with open(os.path.join(eval_args.checkpoint_dir, 'zfilter_%d.p' % eval_args.checkpoint), 'rb') as f:
   running_state = pickle.load(f)
@@ -336,7 +373,7 @@ def get_batch(batch_size):
 
   return reward_batch, reward_sum, batch
 
-for i_episode in range(args.n_epochs):
+for i_episode in range(1): #eval_args.n_epochs):
   batch_size = args.batch_size
   #_, _, batch = get_batch(batch_size)
   #g_mu_1 = get_policy_grad(batch)
@@ -346,7 +383,8 @@ for i_episode in range(args.n_epochs):
 
   # Compute variance
   reward_batch, _, batch = get_batch(batch_size)
-  print(reward_batch)
+  #print(reward_batch)
   var_hat = estimate_variance(batch)
-  print(var_hat)
   #print(np.mean((vectorize(g_mu_1) * vectorize(g_mu_2)).data.numpy()))
+
+  print(json.dumps([eval_args.checkpoint, var_hat.tolist()]))

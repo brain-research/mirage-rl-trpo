@@ -347,7 +347,7 @@ for i_episode in range(args.n_epochs):
             if done:
                 mask = 0
 
-            memory.push(state, np.array([action]), np.array([epsilon]), mask, next_state, reward, t)
+            memory.push(state, np.array([action]), np.array([epsilon]), mask, next_state, reward, t, None)
 
             if args.render:
                 env.render()

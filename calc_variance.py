@@ -67,11 +67,14 @@ nets = [('policy', policy_net),
 for (net_name, net) in nets:
   net.load_state_dict(torch.load(os.path.join(args.checkpoint_dir, '%s_%d.chkpt' % (net_name, eval_args.checkpoint))))
 
-def select_action(state):
+def select_action(state, epsilon=None):
     state = torch.from_numpy(state).unsqueeze(0)
     action_mean, _, action_std = policy_net(Variable(state))
-    epsilon = Variable(torch.normal(torch.zeros(action_mean.size()),
-                                    torch.ones(action_std.size())))
+
+    if epsilon is None:
+      epsilon = Variable(torch.normal(torch.zeros(action_mean.size()),
+                                      torch.ones(action_std.size())))
+
     action = action_mean + epsilon * action_std
     return action, epsilon
 
@@ -80,6 +83,9 @@ def compute_values(value_net, states, discounted_time_left, use_disc_avg_v=False
     return discounted_time_left * value_net(states)
   else:
     return value_net(states)
+
+def vectorize(t):
+  return torch.cat([x.view(-1) for x in t])
 
 def get_advantages(batch):
   rewards = torch.Tensor(batch.reward)
@@ -111,164 +117,126 @@ def get_advantages(batch):
   return advantages
 
 def get_policy_grad(batch):
-    actions = torch.Tensor(np.concatenate(batch.action, 0))
-    states = torch.Tensor(batch.state)
-    advantages = get_advantages(batch)
+  # Policy gradient for an entire batch averaged over time steps
+  actions = torch.Tensor(np.concatenate(batch.action, 0))
+  states = torch.Tensor(batch.state)
+  advantages = get_advantages(batch)
 
-    action_means, action_log_stds, action_stds = policy_net(Variable(states))
-    fixed_log_prob = normal_log_density(Variable(actions), action_means, action_log_stds, action_stds).data.clone()
+  action_means, action_log_stds, action_stds = policy_net(Variable(states))
+  fixed_log_prob = normal_log_density(Variable(actions), action_means, action_log_stds, action_stds).data.clone()
 
-    def get_loss(volatile=False):
-        action_means, action_log_stds, action_stds = policy_net(Variable(states, volatile=volatile))
-        log_prob = normal_log_density(Variable(actions), action_means, action_log_stds, action_stds)
-        action_loss = -Variable(advantages) * torch.exp(log_prob - Variable(fixed_log_prob))
-        return action_loss.mean()
+  def get_loss(volatile=False):
+      action_means, action_log_stds, action_stds = policy_net(Variable(states, volatile=volatile))
+      log_prob = normal_log_density(Variable(actions), action_means, action_log_stds, action_stds)
+      action_loss = -Variable(advantages) * torch.exp(log_prob - Variable(fixed_log_prob))
+      return action_loss.mean()
 
-    loss = get_loss()
-    grads = torch.autograd.grad(loss, policy_net.parameters())
-    return grads
-
-def vectorize(t):
-  return torch.cat([x.view(-1) for x in t])
-
-def estimate_variance(batch, g_mu_1, g_mu_2):
-    rewards = torch.Tensor(batch.reward)
-    masks = torch.Tensor(batch.mask)
-    actions = torch.Tensor(np.concatenate(batch.action, 0))
-    epsilons = torch.Tensor(np.concatenate(batch.epsilon, 0))
-    states = torch.Tensor(batch.state)
-    time_left = args.max_time - torch.Tensor(batch.time)
-    discounted_time_left = Variable((1 - torch.pow(args.gamma, time_left))/(1 - args.gamma)).view(-1, 1)
-
-    # Compute values and control variates
-    values = compute_values(value_net, Variable(states), discounted_time_left, args.use_disc_avg_v)
-
-    returns = torch.Tensor(actions.size(0),1)
-    deltas = torch.Tensor(actions.size(0),1)
-    advantages = torch.Tensor(actions.size(0),1)
-
-    prev_return = 0
-    prev_value = 0
-    prev_advantage = 0
-    for i in reversed(range(rewards.size(0))):
-        returns[i] = rewards[i] + args.gamma * prev_return * masks[i]
-        deltas[i] = rewards[i] + args.gamma * prev_value * masks[i] - values.data[i]
-        advantages[i] = deltas[i] + args.gamma * args.tau * prev_advantage * masks[i]
-
-        prev_return = returns[i, 0]
-        prev_value = values.data[i, 0]
-        prev_advantage = advantages[i, 0]
+  loss = get_loss()
+  grad = torch.autograd.grad(loss, policy_net.parameters())
+  return vectorize(grad).data.numpy()
 
 
-    def grad_log_pi(state, action):
-      # Compute \nabla \log \pi (action | state) for a single time step
-      state = Variable(torch.Tensor(state).view(1, -1))
-      action = Variable(torch.Tensor(action).view(1, -1))
-      action_means, action_log_stds, action_stds = policy_net(state)
-      log_prob = normal_log_density(action, action_means,
-                                    action_log_stds, action_stds)
-      grad = torch.autograd.grad(log_prob, policy_net.parameters())
-      return vectorize(grad).data.numpy()
-
-    # Select random state, compute gradient estimate for that state
-    psi_vars = []
-    for _ in range(10):
-      i = random.randint(0, rewards.size(0)-1)
-
-      s = states[i, :].numpy()
-      a = actions[i, :].numpy()
-      mujoco_state = batch.mujoco_state[i]
-      time_left = args.max_time - batch.time[i]
-
-      vecs = []
-
-      common_epsilons = [Variable(torch.normal(torch.zeros(epsilons.size()),
-                                               torch.ones(epsilons.size()))) for _ in range(10)]
-
-      x = calc_advantage_estimator(mujoco_state, a, time_left, common_epsilons[0]) * grad_log_pi(s, a)
-      y = calc_advantage_estimator(mujoco_state, a, time_left, common_epsilons[1]) * grad_log_pi(s, a)
-
-      a, _ = select_action(s)
-      a = a.data[0].numpy()
-      w = calc_advantage_estimator(mujoco_state, a, time_left, common_epsilons[0]) * grad_log_pi(s, a)
-
-      a, _ = select_action(s)
-      a = a.data[0].numpy()
-      z = calc_advantage_estimator(mujoco_state, a, time_left, common_epsilons[1]) * grad_log_pi(s, a)
-
-      #print((np.mean(x*x), np.mean(x*y), np.mean(x*x - x*y)))
-      psi_vars.append((np.mean(x*x + y*y)/2, np.mean(x*y), np.mean(w*z)))
-      #print(psi_vars[-1])
-
-      #mu = 0
-      #print('new state')
-      #for _ in range(10):
-      #  a, _ = select_action(s)
-      #  a = a.data[0].numpy()
+def grad_log_pi(state, action):
+  # Compute \nabla \log \pi (action | state) for a single time step
+  state = Variable(torch.Tensor(state).view(1, -1))
+  action = Variable(torch.Tensor(action).view(1, -1))
+  action_means, action_log_stds, action_stds = policy_net(state)
+  log_prob = normal_log_density(action, action_means,
+                                action_log_stds, action_stds)
+  grad = torch.autograd.grad(log_prob, policy_net.parameters())
+  return vectorize(grad).data.numpy()
 
 
-      #  w = 0
-      #  for j in range(10):
-      #    w += calc_advantage_estimator(mujoco_state, a, time_left, common_epsilons[j])
-      #  w /= 10
-      #  w *= grad_log_pi(s, a)
-      #  mu += w
-      #  vecs.append(w)
 
-      #mu /= len(vecs)
-      #psi_vars.append(np.mean([np.mean(np.square(vec - mu)) for vec in vecs]))
+def estimate_variance(batch, n_samples=50):
+  """
+  Need 4 rollouts, can reuse 1 rollout throughout
 
-      #print(psi_vars[-1])
+  Function to compute grad log pi would be useful
 
-    return np.mean(psi_vars, axis=0)
+  get a from action[i]
+    x = Advantage(s, a) * grad log pi(a, s)
+    y = hat_A(s, a) * grad_log_pi(a, s)
 
-    """
-    Need 4 rollouts, can reuse 1 rollout throughout
+  sample a | s
+    w = hat_A(s, a) * grad_log_pi(a, s)
 
-    Function to compute grad log pi would be useful
+  sample a | s
+    z = hat_A(s, a) * grad_log_pi(a, s)
 
-    get a from action[i]
-      x = Advantage(s, a) * grad log pi(a, s)
-      y = hat_A(s, a) * grad_log_pi(a, s)
+  x and y share the same action (which is the action we took originally)
+  reuse precomputed advantage for x
 
-    sample a | s
-      w = hat_A(s, a) * grad_log_pi(a, s)
+  var.append((x - w)*(y - z))
+  """
+  actions = np.concatenate(batch.action, 0)
+  epsilons = torch.Tensor(np.concatenate(batch.epsilon, 0))
+  states = batch.state
 
-    sample a | s
-      z = hat_A(s, a) * grad_log_pi(a, s)
+  n_steps = len(batch.state)
 
-    x and y share the same action (which is the action we took originally)
-    reuse precomputed advantage for x
+  variance_hats = []
+  for _ in range(n_samples):
+    # Select random state
+    i = random.randint(0, n_steps-1)
 
-    var.append((x - w)*(y - z))
-    """
+    s = states[i]
+    a = actions[i, :]
+    mujoco_state = batch.mujoco_state[i]
+    time_left = args.max_time - batch.time[i]
 
-    # Select random state, compute gradient for that state
-    var_hat = []
-    g_mu = 0
-    for i in range(0, rewards.size(0)):
-      #i = random.randint(0, rewards.size(0)-1)
+#    common_epsilons = [Variable(torch.normal(torch.zeros(epsilons.size()),
+#                                             torch.ones(epsilons.size()))) for _ in range(10)]
 
-      action_means, action_log_stds, action_stds = policy_net(Variable(states[i, :].view(1, -1)))
-      log_prob = normal_log_density(Variable(actions[i, :].view(1, -1)), action_means, action_log_stds, action_stds)
-      action_loss = -Variable(advantages[i]) * log_prob
+    shared_grad_log_pi = grad_log_pi(s, a)
+    sq_shared_grad_log_pi = shared_grad_log_pi * shared_grad_log_pi
 
-      g = torch.autograd.grad(action_loss, policy_net.parameters())
-      g = vectorize(g)
-      var_hat.append(((g - g_mu_1) * (g - g_mu_2)).mean().data.numpy())
-      g_mu += g
+    q_x = calc_advantage_estimator(mujoco_state, a, time_left)
+    q_y = calc_advantage_estimator(mujoco_state, a, time_left)
 
-    g_mu /= rewards.size(0)
+    # Calculation value function estimates
+    a, _ = select_action(s)
+    a = a.data[0].numpy()
+    v_x = calc_advantage_estimator(mujoco_state, a, time_left)
 
-    return np.array(var_hat).mean()
+    a, _ = select_action(s)
+    a = a.data[0].numpy()
+    v_y = calc_advantage_estimator(mujoco_state, a, time_left)
 
-def select_action_epsilon(state, epsilon):
-    state = torch.from_numpy(state).unsqueeze(0)
-    action_mean, _, action_std = policy_net(Variable(state))
-    action = action_mean + epsilon * action_std
-    return action
+    a, _ = select_action(s)
+    a = a.data[0].numpy()
+    q = calc_advantage_estimator(mujoco_state, a, time_left)
+    unshared_grad_log_pi = grad_log_pi(s, a)
 
-def calc_advantage_estimator(mujoco_state, action, time_left, epsilons):
+    full_grad_var = np.mean(q_x*q_x*sq_shared_grad_log_pi + q_y*q_y*sq_shared_grad_log_pi)/2
+    shared_sq_term = -np.mean((q_x - v_x)*(q - v_y)*shared_grad_log_pi * unshared_grad_log_pi +
+                              (q - v_x)*(q_y - v_y)*shared_grad_log_pi * unshared_grad_log_pi)/2
+    no_baseline_conditional_var = np.mean(q_x*q_y*sq_shared_grad_log_pi) + shared_sq_term
+    value_baseline_conditional_var = np.mean((q_x - v_x)*(q_y - v_y)*sq_shared_grad_log_pi) + shared_sq_term
+
+    variance_hats.append((full_grad_var,
+                          no_baseline_conditional_var,
+                          value_baseline_conditional_var,
+                          ))
+
+    ## Use shared action for x, y
+    #x = calc_advantage_estimator(mujoco_state, a, time_left) * grad_log_pi(s, a)
+    #y = calc_advantage_estimator(mujoco_state, a, time_left) * grad_log_pi(s, a)
+
+    #a, _ = select_action(s)
+    #a = a.data[0].numpy()
+    #w = calc_advantage_estimator(mujoco_state, a, time_left) * grad_log_pi(s, a)
+
+    #a, _ = select_action(s)
+    #a = a.data[0].numpy()
+    #z = calc_advantage_estimator(mujoco_state, a, time_left) * grad_log_pi(s, a)
+
+    #variance_hats.append((np.mean(x*x + y*y)/2, np.mean(x*y), np.mean(w*z)))
+
+  return np.mean(variance_hats, axis=0)
+
+
+def calc_advantage_estimator(mujoco_state, action, time_left, epsilons=None):
   # Compute the GAE advantage estimate starting from a state and
   # taking a particular action until time_left or done.
   rewards = []
@@ -295,7 +263,7 @@ def calc_advantage_estimator(mujoco_state, action, time_left, epsilons):
     else:
       masks.append(1.)
 
-    action = select_action_epsilon(state, epsilons[t, :])
+    action, _ = select_action(state, epsilon=epsilons[t, :] if epsilons is not None else None)
     action = action.data[0].numpy()
 
   # Compute GAE estimator
@@ -322,7 +290,8 @@ def calc_advantage_estimator(mujoco_state, action, time_left, epsilons):
     prev_value = values.data[i].numpy()[0]
     prev_advantage = advantages[i]
 
-  return advantages[0]
+  #return advantages[0], returns[0]
+  return returns[0]
 
 with open(os.path.join(eval_args.checkpoint_dir, 'zfilter_%d.p' % eval_args.checkpoint), 'rb') as f:
   running_state = pickle.load(f)
@@ -369,16 +338,15 @@ def get_batch(batch_size):
 
 for i_episode in range(args.n_epochs):
   batch_size = args.batch_size
-  _, _, batch = get_batch(batch_size)
-  g_mu_1 = get_policy_grad(batch)
+  #_, _, batch = get_batch(batch_size)
+  #g_mu_1 = get_policy_grad(batch)
 
-  _, _, batch = get_batch(batch_size)
-  g_mu_2 = get_policy_grad(batch)
+  #_, _, batch = get_batch(batch_size)
+  #g_mu_2 = get_policy_grad(batch)
 
   # Compute variance
-  _, _, batch = get_batch(batch_size)
-  var_hat = estimate_variance(batch, vectorize(g_mu_1),
-                    vectorize(g_mu_2))
-
+  reward_batch, _, batch = get_batch(batch_size)
+  print(reward_batch)
+  var_hat = estimate_variance(batch)
   print(var_hat)
-  print(np.mean((vectorize(g_mu_1) * vectorize(g_mu_2)).data.numpy()))
+  #print(np.mean((vectorize(g_mu_1) * vectorize(g_mu_2)).data.numpy()))

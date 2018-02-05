@@ -75,7 +75,7 @@ env.seed(args.seed)
 torch.manual_seed(args.seed)
 
 policy_net = Policy(num_inputs, num_actions)
-value_net = Value(num_inputs)
+value_net = Value(num_inputs, args.use_disc_avg_v)
 value_optim = torch.optim.Adam(value_net.parameters(),
                                lr=args.control_variate_lr)
 
@@ -101,7 +101,8 @@ def select_action(state):
 
 def compute_values(value_net, states, discounted_time_left, use_disc_avg_v=False):
   if use_disc_avg_v:
-    return discounted_time_left * value_net(states)
+    state_value, disc_avg_state_value = value_net(states)
+    return state_value + discounted_time_left * disc_avg_state_value
   else:
     return value_net(states)
 

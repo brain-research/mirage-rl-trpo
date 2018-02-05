@@ -53,17 +53,20 @@ env.seed(eval_args.seed)
 torch.manual_seed(eval_args.seed)
 
 policy_net = Policy(num_inputs, num_actions)
-value_net = Value(num_inputs)
-control_variate_net = Value(num_inputs)
-advantage_net = Value(num_inputs + num_actions)
-env_net = EnvModel(num_inputs + num_actions, num_inputs)
+value_net = Value(num_inputs, args.use_disc_avg_v)
+state_cv_net = Value(num_inputs)
+state_action_cv_net = Value(num_inputs + num_actions)
+gae_state_cv_net = Value(num_inputs)
+gae_state_action_cv_net = Value(num_inputs + num_actions)
 
 # Read in the networks
 nets = [('policy', policy_net),
         ('value', value_net),
-        ('v', control_variate_net),
-        ('q', advantage_net),
-        ('env', env_net), ]
+        ('v', state_cv_net),
+        ('q', state_action_cv_net),
+        ('gae_v', gae_state_cv_net),
+        ('gae_q', gae_state_action_cv_net), ]
+
 for (net_name, net) in nets:
   net.load_state_dict(torch.load(os.path.join(args.checkpoint_dir, '%s_%d.chkpt' % (net_name, eval_args.checkpoint))))
 
@@ -80,7 +83,8 @@ def select_action(state, epsilon=None):
 
 def compute_values(value_net, states, discounted_time_left, use_disc_avg_v=False):
   if use_disc_avg_v:
-    return discounted_time_left * value_net(states)
+    state_value, disc_avg_state_value = value_net(states)
+    return state_value + discounted_time_left * disc_avg_state_value
   else:
     return value_net(states)
 
@@ -116,6 +120,7 @@ def get_advantages(batch):
 
   return advantages
 
+
 def get_policy_grad(batch):
   # Policy gradient for an entire batch averaged over time steps
   actions = torch.Tensor(np.concatenate(batch.action, 0))
@@ -146,34 +151,45 @@ def grad_log_pi(state, action):
   grad = torch.autograd.grad(log_prob, policy_net.parameters())
   return vectorize(grad).data.numpy()
 
+def compute_estimators(q_x, q_y, q, v_x, v_y, value_func_est, q_func_est, q_func_est_prime,
+                       shared_grad_log_pi, unshared_grad_log_pi):
+  sq_shared_grad_log_pi = shared_grad_log_pi * shared_grad_log_pi
+  term_1 = np.mean(q_x*q_x*sq_shared_grad_log_pi + q_y*q_y*sq_shared_grad_log_pi)/2
+  term_2 = np.mean(q_x*q_y*sq_shared_grad_log_pi)
+  term_2_value_baseline = np.mean((q_x - v_x)*(q_y - v_y)*sq_shared_grad_log_pi)
+  term_2_value_func_est_baseline = np.mean((q_x - value_func_est)*
+                                           (q_y - value_func_est)*
+                                           sq_shared_grad_log_pi)
+  term_2_q_func_est_baseline = np.mean((q_x - q_func_est)*
+                                       (q_y - q_func_est)*
+                                       sq_shared_grad_log_pi)
+
+  # Might as well use the value estimates to reduce the variance of this term
+  term_3 = np.mean((q_x - v_x)*(q - v_y)*shared_grad_log_pi * unshared_grad_log_pi +
+                   (q - v_x)*(q_y - v_y)*shared_grad_log_pi * unshared_grad_log_pi)/2
+  term_3_q_func_est_baseline = np.mean((q_x - q_func_est)*(q - q_func_est_prime)*shared_grad_log_pi * unshared_grad_log_pi +
+                                       (q - q_func_est_prime)*(q_y - q_func_est)*shared_grad_log_pi * unshared_grad_log_pi)/2
+
+  var_term_1 = term_1 - term_2
+  var_term_2 = term_2 - term_3
+  var_term_2_value_func_est_baseline = term_2_value_func_est_baseline - term_3
+  var_term_2_q_func_est_baseline = term_2_q_func_est_baseline - term_3_q_func_est_baseline
+  var_term_2_value_baseline = term_2_value_baseline - term_3
+  var_term_3 = term_3 # - E[g]^2 which is small, so this is an upper bound
+
+  return var_term_1, var_term_2, var_term_2_value_func_est_baseline, var_term_2_q_func_est_baseline, var_term_2_value_baseline, var_term_3
 
 
 def estimate_variance(batch, n_samples=50):
-  """
-  Need 4 rollouts, can reuse 1 rollout throughout
-
-  Function to compute grad log pi would be useful
-
-  get a from action[i]
-    x = Advantage(s, a) * grad log pi(a, s)
-    y = hat_A(s, a) * grad_log_pi(a, s)
-
-  sample a | s
-    w = hat_A(s, a) * grad_log_pi(a, s)
-
-  sample a | s
-    z = hat_A(s, a) * grad_log_pi(a, s)
-
-  x and y share the same action (which is the action we took originally)
-  reuse precomputed advantage for x
-
-  var.append((x - w)*(y - z))
-  """
   actions = np.concatenate(batch.action, 0)
   epsilons = torch.Tensor(np.concatenate(batch.epsilon, 0))
   states = batch.state
-
   n_steps = len(batch.state)
+
+  def _select_action(state):
+    a, _ = select_action(s)
+    a = a.data[0].numpy()
+    return a
 
   variance_hats = []
   for _ in range(n_samples):
@@ -184,91 +200,46 @@ def estimate_variance(batch, n_samples=50):
     a = actions[i, :]
     mujoco_state = batch.mujoco_state[i]
     time_left = args.max_time - batch.time[i]
+    discounted_time_left = (1. - args.gamma ** time_left) / (1. - args.gamma)
 
-#    common_epsilons = [Variable(torch.normal(torch.zeros(epsilons.size()),
-#                                             torch.ones(epsilons.size()))) for _ in range(10)]
+    # Compute function approximators
+    value_func_base_est = compute_values(value_net, Variable(torch.Tensor(s)),
+                                         Variable(torch.Tensor([discounted_time_left])),
+                                         args.use_disc_avg_v).data.numpy()[0]
+    value_func_est = value_func_base_est + state_cv_net(Variable(torch.Tensor(s))).data.numpy()[0]
+    gae_value_func_est = gae_state_cv_net(Variable(torch.Tensor(s))).data.numpy()[0]
 
-    value_func_est = control_variate_net(Variable(torch.Tensor(s))).data.numpy()[0]
+    q_func_est = value_func_base_est + state_action_cv_net(
+        Variable(torch.cat([torch.Tensor(s), torch.Tensor(a)]))).data.numpy()[0]
+    gae_q_func_est = gae_state_action_cv_net(Variable(torch.cat([torch.Tensor(s), torch.Tensor(a)]))).data.numpy()[0]
 
     shared_grad_log_pi = grad_log_pi(s, a)
-    sq_shared_grad_log_pi = shared_grad_log_pi * shared_grad_log_pi
 
-    q_x = calc_advantage_estimator(mujoco_state, a, time_left)
-    q_y = calc_advantage_estimator(mujoco_state, a, time_left)
-
-    q_func_est = advantage_net(Variable(torch.cat([torch.Tensor(s), torch.Tensor(a)]))).data.numpy()[0]
+    q_x, gae_q_x = calc_advantage_estimator(mujoco_state, a, time_left)
+    q_y, gae_q_y = calc_advantage_estimator(mujoco_state, a, time_left)
 
     # Calculation value function estimates
-    a, _ = select_action(s)
-    a = a.data[0].numpy()
-    v_x = calc_advantage_estimator(mujoco_state, a, time_left)
+    a = _select_action(s)
+    v_x, gae_v_x = calc_advantage_estimator(mujoco_state, a, time_left)
 
-    a, _ = select_action(s)
-    a = a.data[0].numpy()
-    v_y = calc_advantage_estimator(mujoco_state, a, time_left)
+    a = _select_action(s)
+    v_y, gae_v_y = calc_advantage_estimator(mujoco_state, a, time_left)
 
-    a, _ = select_action(s)
-    a = a.data[0].numpy()
-    q = calc_advantage_estimator(mujoco_state, a, time_left)
+    a = _select_action(s)
+    q, gae_q = calc_advantage_estimator(mujoco_state, a, time_left)
     unshared_grad_log_pi = grad_log_pi(s, a)
 
-    q_func_est_prime = advantage_net(Variable(torch.cat([torch.Tensor(s), torch.Tensor(a)]))).data.numpy()[0]
+    q_func_est_prime = value_func_est + state_action_cv_net(
+        Variable(torch.cat([torch.Tensor(s), torch.Tensor(a)]))).data.numpy()[0]
+    gae_q_func_est_prime = gae_state_action_cv_net(Variable(torch.cat([torch.Tensor(s), torch.Tensor(a)]))).data.numpy()[0]
 
-    term_1 = np.mean(q_x*q_x*sq_shared_grad_log_pi + q_y*q_y*sq_shared_grad_log_pi)/2
-    term_2 = np.mean(q_x*q_y*sq_shared_grad_log_pi)
-    term_2_value_baseline = np.mean((q_x - v_x)*(q_y - v_y)*sq_shared_grad_log_pi)
-    term_2_value_func_est_baseline = np.mean((q_x - value_func_est)*
-                                             (q_y - value_func_est)*
-                                             sq_shared_grad_log_pi)
-    term_2_q_func_est_baseline = np.mean((q_x - q_func_est)*
-                                         (q_y - q_func_est)*
-                                         sq_shared_grad_log_pi)
-
-    # Might as well use the value estimates to reduce the variance of this term
-    term_3 = np.mean((q_x - v_x)*(q - v_y)*shared_grad_log_pi * unshared_grad_log_pi +
-                     (q - v_x)*(q_y - v_y)*shared_grad_log_pi * unshared_grad_log_pi)/2
-    term_3_q_func_est_baseline = np.mean((q_x - q_func_est)*(q - q_func_est_prime)*shared_grad_log_pi * unshared_grad_log_pi +
-                                         (q - q_func_est_prime)*(q_y - q_func_est)*shared_grad_log_pi * unshared_grad_log_pi)/2
-
-    var_term_1 = term_1 - term_2
-    var_term_2 = term_2 - term_3
-    var_term_2_value_func_est_baseline = term_2_value_func_est_baseline - term_3
-    var_term_2_q_func_est_baseline = term_2_q_func_est_baseline - term_3_q_func_est_baseline
-    var_term_2_value_baseline = term_2_value_baseline - term_3
-    var_term_3 = term_3 # - E[g]^2 which is small, so this is an upper bound
-
-    variance_hats.append((var_term_1,
-                          var_term_2,
-                          var_term_2_value_func_est_baseline,
-                          var_term_2_q_func_est_baseline,
-                          var_term_2_value_baseline,
-                          var_term_3,
-                          ))
-
-    #full_grad_var = np.mean(q_x*q_x*sq_shared_grad_log_pi + q_y*q_y*sq_shared_grad_log_pi)/2
-    #shared_sq_term = -np.mean((q_x - v_x)*(q - v_y)*shared_grad_log_pi * unshared_grad_log_pi +
-    #                          (q - v_x)*(q_y - v_y)*shared_grad_log_pi * unshared_grad_log_pi)/2
-    #no_baseline_conditional_var = np.mean(q_x*q_y*sq_shared_grad_log_pi) + shared_sq_term
-    #value_baseline_conditional_var = np.mean((q_x - v_x)*(q_y - v_y)*sq_shared_grad_log_pi) + shared_sq_term
-
-    #variance_hats.append((full_grad_var,
-    #                      no_baseline_conditional_var,
-    #                      value_baseline_conditional_var,
-    #                      ))
-
-    ## Use shared action for x, y
-    #x = calc_advantage_estimator(mujoco_state, a, time_left) * grad_log_pi(s, a)
-    #y = calc_advantage_estimator(mujoco_state, a, time_left) * grad_log_pi(s, a)
-
-    #a, _ = select_action(s)
-    #a = a.data[0].numpy()
-    #w = calc_advantage_estimator(mujoco_state, a, time_left) * grad_log_pi(s, a)
-
-    #a, _ = select_action(s)
-    #a = a.data[0].numpy()
-    #z = calc_advantage_estimator(mujoco_state, a, time_left) * grad_log_pi(s, a)
-
-    #variance_hats.append((np.mean(x*x + y*y)/2, np.mean(x*y), np.mean(w*z)))
+    variance_hats.append(
+        compute_estimators(q_x, q_y, q, v_x, v_y,
+                           value_func_est, q_func_est, q_func_est_prime,
+                           shared_grad_log_pi, unshared_grad_log_pi) +
+        compute_estimators(gae_q_x, gae_q_y, gae_q, gae_v_x, gae_v_y,
+                           gae_value_func_est, gae_q_func_est, gae_q_func_est_prime,
+                           shared_grad_log_pi, unshared_grad_log_pi))
 
   return np.mean(variance_hats, axis=0)
 
@@ -327,8 +298,7 @@ def calc_advantage_estimator(mujoco_state, action, time_left, epsilons=None):
     prev_value = values.data[i].numpy()[0]
     prev_advantage = advantages[i]
 
-  return advantages[0]
-  #return returns[0]
+  return returns[0], advantages[0]
 
 with open(os.path.join(eval_args.checkpoint_dir, 'zfilter_%d.p' % eval_args.checkpoint), 'rb') as f:
   running_state = pickle.load(f)
@@ -373,7 +343,7 @@ def get_batch(batch_size):
 
   return reward_batch, reward_sum, batch
 
-for i_episode in range(40): #eval_args.n_epochs):
+for i_episode in range(2): #eval_args.n_epochs):
   batch_size = args.batch_size
   #_, _, batch = get_batch(batch_size)
   #g_mu_1 = get_policy_grad(batch)
@@ -384,7 +354,8 @@ for i_episode in range(40): #eval_args.n_epochs):
   # Compute variance
   reward_batch, _, batch = get_batch(batch_size)
   #print(reward_batch)
-  var_hat = estimate_variance(batch)
+  var_hat = estimate_variance(batch,
+                              n_samples=10)
   #print(np.mean((vectorize(g_mu_1) * vectorize(g_mu_2)).data.numpy()))
 
   print(json.dumps([eval_args.checkpoint, var_hat.tolist()]))

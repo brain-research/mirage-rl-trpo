@@ -9,7 +9,7 @@ import seaborn as sns
 sns.set()
 matplotlib.rc('text', usetex=True)
 
-def plot(log_file, title, smoother=None):
+def plot(log_file, title, smoother=None, gae=True, legend=True):
   with open(log_file, 'r') as f:
     variances = {}
 
@@ -32,6 +32,9 @@ def plot(log_file, title, smoother=None):
       (5, '$\Sigma_3$'),
         ]:
 
+    if gae:
+      index += 6
+
     # Smooth, clip, log y
     processor = lambda y: np.log(np.clip(smoother(y), 1e-3, 1e6))
 
@@ -40,21 +43,36 @@ def plot(log_file, title, smoother=None):
     plot_y_lower = processor(y_mu[:, index] - 2*y_std[:, index])
     plot_x = x * 5/1000
     plt.plot(plot_x, plot_y, label=label)
-    plt.fill_between(plot_x, plot_y_lower, plot_y_upper, alpha=0.3)
+    plt.fill_between(plot_x, plot_y_lower, plot_y_upper, alpha=0.2)
 
   plt.title(title)
   plt.ylabel('ln(Variance)')
   plt.xlabel('Steps (millions)')
-  plt.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=20)
+  if legend:
+    plt.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=20)
   plt.savefig('%s_variance_gae.pdf' % title, bbox_inches='tight')
   plt.savefig('%s_variance_gae.png' % title, bbox_inches='tight')
+
+def ema(x, alpha=0.9):
+  res = []
+  mu = 0.
+  for val in x:
+    mu = alpha*mu + (1 - alpha)*val
+    res.append(mu)
+
+  return np.array(res)
 
 if __name__ == '__main__':
   log_file = sys.argv[1]
 
   plot(log_file,
-       title='HalfCheetah-v1',
-       #title='Humanoid-v1',
-       #smoother=lambda x: savgol_filter(x, 21, 1))
-       smoother=lambda x: x)
+       #title='HalfCheetah-v1',
+       title='Humanoid-v1',
+       #smoother=lambda x: savgol_filter(x, 21, 1),
+       #smoother=lambda x: x,
+       smoother=lambda x: ema(x),
+       #gae=False,
+       gae=True,
+       legend=False,
+       )
 

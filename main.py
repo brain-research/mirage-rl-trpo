@@ -86,11 +86,6 @@ advantage_net = Value(num_inputs + num_actions)
 advantage_optim = torch.optim.Adam(advantage_net.parameters(),
                                    lr=args.control_variate_lr)
 
-# 1 step environment model
-env_net = EnvModel(num_inputs + num_actions, num_inputs)
-env_optim = torch.optim.Adam(env_net.parameters(),
-                             lr=args.control_variate_lr/3)
-
 def select_action(state):
     state = torch.from_numpy(state).unsqueeze(0)
     action_mean, _, action_std = policy_net(Variable(state))
@@ -172,18 +167,8 @@ def update_params(batch):
     logging_info['mse_v'] = (advantages - control_variates.data).pow(2).mean()
     logging_info['mse_q'] = (advantages - advantage_estimator.data).pow(2).mean()
 
-    # Disable normalization of advantages
-    # advantages = (advantages - advantages.mean()) / advantages.std()
-
     action_means, action_log_stds, action_stds = policy_net(Variable(states))
     fixed_log_prob = normal_log_density(Variable(actions), action_means, action_log_stds, action_stds).data.clone()
-
-    reward_hat, next_obs_delta_hat = env_net(Variable(torch.cat(
-        (states, actions), dim=1)))
-    next_obs_hat = Variable(states) + next_obs_delta_hat
-    # TODO: Fix time for 1 step in the future!
-    next_value_hat = compute_values(value_net, next_obs_hat, discounted_time_left, args.use_disc_avg_v)
-    disc_sum_reward_hat = reward_hat + args.gamma * next_value_hat
 
     def get_loss(volatile=False, baseline="none"):
         action_means, action_log_stds, action_stds = policy_net(Variable(states, volatile=volatile))
@@ -199,16 +184,6 @@ def update_params(batch):
               (Variable(states), current_policy_action), dim=1))
           action_loss = -((Variable(advantages) - advantage_estimator.detach()) * torch.exp(log_prob - Variable(fixed_log_prob))
                           + current_policy_advantage_estimator)
-        elif baseline == "model":
-          current_policy_action = action_means + Variable(epsilons) * action_stds
-          current_policy_reward_hat, current_policy_next_obs_delta_hat = env_net(torch.cat(
-              (Variable(states), current_policy_action), dim=1))
-          current_policy_next_obs_hat = Variable(states) + current_policy_next_obs_delta_hat
-          current_policy_next_value_hat = value_net(current_policy_next_obs_hat)
-          current_policy_disc_sum_reward_hat = current_policy_reward_hat + args.gamma * current_policy_next_value_hat
-
-          action_loss = -((Variable(advantages) + values.detach() - disc_sum_reward_hat.detach()) * torch.exp(log_prob - Variable(fixed_log_prob))
-                          + current_policy_disc_sum_reward_hat)
         else:
           exit()
 
@@ -225,14 +200,6 @@ def update_params(batch):
         return kl.sum(1, keepdim=True)
 
     trpo_step(policy_net, functools.partial(get_loss, baseline=args.baseline), get_kl, args.max_kl, args.damping)
-
-    for baseline in ["none", "v", "q", "model"]:
-      loss = get_loss(baseline=baseline)
-      grads = torch.autograd.grad(loss, policy_net.parameters())
-      loss_grad_mse = torch.cat([grad.view(-1) for grad in grads]).data.pow(2).mean()
-
-      print("%s grad MSE: %g" % (baseline, loss_grad_mse))
-      logging_info['grad_mse_%s' % baseline] = loss_grad_mse
 
     # Update control variates
 
@@ -260,29 +227,6 @@ def update_params(batch):
       advantage_net_loss.backward()
       advantage_optim.step()
 
-    # 1-step model baseline
-    env_net_loss_mse = None
-    for _ in range(control_variate_epochs):
-      reward_hat, next_obs_delta_hat = env_net(Variable(torch.cat(
-        (states, actions), dim=1)))
-      next_obs_hat = Variable(states) + next_obs_delta_hat
-      # TODO: Fix discounted time left to account for 1 time step in the future!
-      next_value_hat = compute_values(value_net, next_obs_hat, discounted_time_left, args.use_disc_avg_v)
-      disc_sum_reward_hat = reward_hat + args.gamma * next_value_hat
-
-      env_optim.zero_grad()
-      #env_net_loss = (Variable(rewards) - reward_hat.view(-1)).pow(2).mean()
-      env_net_loss = (control_variate_targets + detached_values - disc_sum_reward_hat).pow(2).mean()
-      #env_net_loss = (targets - disc_sum_reward_hat).pow(2).mean()
-      env_net_loss.backward()
-      env_optim.step()
-
-      if env_net_loss_mse is None:
-        env_net_loss_mse = env_net_loss.data.numpy()
-        print('Env net MSE: %g' % env_net_loss_mse)
-        logging_info['mse_model'] = env_net_loss_mse[0]
-
-
     # Update value function
     if args.v_optimizer == 'lbfgs':
       flat_params, _, opt_info = scipy.optimize.fmin_l_bfgs_b(get_value_loss, get_flat_params_from(value_net).double().numpy(), maxiter=25)
@@ -297,28 +241,9 @@ def update_params(batch):
     else:
       exit()
 
-    # Deprecated:
-    # Update advantage net
-    # Recompute advanatages w/ the new values
-    #disc_avg_values = discounted_time_left * disc_avg_value_net(Variable(states))
-    #prev_return = 0
-    #prev_value = 0
-    #prev_advantage = 0
-    #for i in reversed(range(rewards.size(0))):
-    #    returns[i] = rewards[i] + args.gamma * prev_return * masks[i]
-    #    deltas[i] = rewards[i] + args.gamma * prev_value * masks[i] - disc_avg_values.data[i]
-    #    advantages[i] = deltas[i] + args.gamma * args.tau * prev_advantage * masks[i]
-
-    #    prev_return = returns[i, 0]
-    #    prev_value = disc_avg_values.data[i, 0]
-    #    prev_advantage = advantages[i, 0]
-    #control_variate_targets = Variable(advantages)
-
-
     return logging_info
 
 running_state = ZFilter((num_inputs,), clip=5)
-#running_reward = ZFilter((1,), demean=False, clip=10)
 
 if args.log_file is not None:
   log_file = open(args.log_file, 'w')
@@ -379,8 +304,7 @@ for i_episode in range(args.n_epochs):
       nets = [('policy', policy_net),
               ('value', value_net),
               ('v', control_variate_net),
-              ('q', advantage_net),
-              ('env', env_net), ]
+              ('q', advantage_net), ]
       for (net_name, net) in nets:
         torch.save(net.state_dict(), os.path.join(args.checkpoint_dir, '%s_%d.chkpt' % (net_name, i_episode)))
       with open(os.path.join(args.checkpoint_dir, 'zfilter_%d.p' % i_episode), 'wb') as out:

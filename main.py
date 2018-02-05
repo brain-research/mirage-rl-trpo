@@ -11,7 +11,6 @@ from replay_memory import Memory
 from running_state import ZFilter
 from torch.autograd import Variable
 from trpo import trpo_step
-from utils import *
 
 import ipdb
 import sys
@@ -19,6 +18,8 @@ import json
 
 torch.utils.backcompat.broadcast_warning.enabled = True
 torch.utils.backcompat.keepdim_warning.enabled = True
+
+from utils import *
 
 torch.set_default_tensor_type('torch.DoubleTensor')
 

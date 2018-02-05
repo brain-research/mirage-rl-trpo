@@ -7,16 +7,16 @@ import numpy as np
 import json
 from scipy.signal import savgol_filter
 import seaborn as sns
+
 from matplotlib import rc
-import matplotlib.patches as mpatches
 # rc('font',**{'family':'sans-serif','sans-serif':['Helvetica']})
 ## for Palatino and other serif fonts use:
 #rc('font',**{'family':'serif','serif':['Palatino']})
 # rc('text', usetex=True)
 
 
-color_list = sns.color_palette("muted")
-sns.palplot(color_list)
+current_palette = sns.color_palette("muted")
+sns.palplot(current_palette)
 
 log_dir = 'gcp3-logs'
 
@@ -46,38 +46,48 @@ for log_file in os.listdir(log_dir):
 
 envs = ['halfcheetah', 'walker2d', 'humanoid']
 envs_titles = {'halfcheetah': 'HalfCheetah', 'walker2d': 'Walker2d', 'humanoid': 'Humanoid'}
+savgol_window = 7
 colors = {}
 for i, thing in enumerate(['v', 'q', 'disc', 'none']):
-  colors[thing] = color_list[i]
+  colors[thing] = current_palette[i]
 
+window_len = 223
 fig, axes = plt.subplots(1, len(envs), figsize=(20, 6))
 for envidx, env in enumerate(envs):
-  i = 0
+  ax = axes[envidx]
   print('envidx', envidx, 'env', env)
+  ys = []
   for k, v in results.items():
     if k[0] == env:
-      y = [[row['reward_batch'] for row in res] for res in v]
-      for j, res in enumerate(y):
-        axes[envidx].plot(np.arange(len(res)) * 5, ema(res, 0.95), color=colors[k[1]],
-                 label='-'.join(k) if j == 0 else None)
-      i += 1
+      y = [[row['reward_batch'] for row in res][:window_len] for res in v]
+      print(len(y))
+      print(len(y[0]))
+      print(len(y[1]))
+      print(len(y[2]))
+      print(len(y[3]))
+      print(len(y[4]))
+      y = np.stack(y)
+      y_z1 = savgol_filter(y.mean(0) + y.std(0), savgol_window, 5)
+      y_z_1 = savgol_filter(y.mean(0) - y.std(0), savgol_window, 5)
+      y_max = savgol_filter(y.max(0), savgol_window, 5)
+      y_min = savgol_filter(y.min(0), savgol_window, 5)
+      y_mean = savgol_filter(y.mean(0), savgol_window, 5)
+      # ax.plot(np.arange(len(res)) * 5, ema(res, 0.95), color=colors[k[1]], label='-'.join(k) if j == 0 else None)
 
-      # Sorting and plotting legend entries
-      handles, labels = axes[envidx].get_legend_handles_labels()
-      import operator
-      hl = sorted(zip(handles, labels),
-                  key=operator.itemgetter(1))
-      handles2, labels2 = zip(*hl)
-      # axes[envidx].legend(handles2, labels2, loc='lower right')
-    axes[envidx].set_title(envs_titles[env])
+      ax.plot(np.arange(window_len) * 5, y_mean, color=colors[k[1]], label='-'.join(k))
+      ax.fill_between(np.arange(window_len) * 5, y_mean, np.where(y_z1 > y_max, y_max, y_z1), color=colors[k[1]], alpha=0.2)
+      ax.fill_between(np.arange(window_len) * 5, np.where(y_z_1 < y_min, y_min, y_z_1), y_mean, color=colors[k[1]], alpha=0.2)
 
-h1 = mpatches.Patch(color=color_list[0], label='State baseline')
-h2 = mpatches.Patch(color=color_list[1], label='State-action baseline')
-h3 = mpatches.Patch(color=color_list[2], label='Discounted value function with no baseline')
-h4 = mpatches.Patch(color=color_list[3], label='No baseline')
-leg = fig.legend(handles=[h3, h4, h1, h2], loc='lower center', ncol=4, prop={'size': 10})
+  # Sorting and plotting legend entries
+  handles, labels = axes[envidx].get_legend_handles_labels()
+  import operator
+  hl = sorted(zip(handles, labels),
+              key=operator.itemgetter(1))
+  handles2, labels2 = zip(*hl)
+  ax.legend(handles2, labels2, loc='upper left')
+  ax.set_title(envs_titles[env])
 
-fig.savefig('disc_value_all.png')
+fig.savefig('disc_value_mean_stds.png')
 quit(1)
 
 # Plot reward for lbfg/y

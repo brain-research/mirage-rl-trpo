@@ -148,7 +148,7 @@ def grad_log_pi(state, action):
 
 
 
-def estimate_variance(batch, n_samples=10):
+def estimate_variance(batch, n_samples=50):
   """
   Need 4 rollouts, can reuse 1 rollout throughout
 
@@ -373,7 +373,7 @@ def get_batch(batch_size):
 
   return reward_batch, reward_sum, batch
 
-for i_episode in range(1): #eval_args.n_epochs):
+for i_episode in range(40): #eval_args.n_epochs):
   batch_size = args.batch_size
   #_, _, batch = get_batch(batch_size)
   #g_mu_1 = get_policy_grad(batch)
@@ -388,3 +388,4 @@ for i_episode in range(1): #eval_args.n_epochs):
   #print(np.mean((vectorize(g_mu_1) * vectorize(g_mu_2)).data.numpy()))
 
   print(json.dumps([eval_args.checkpoint, var_hat.tolist()]))
+  sys.stdout.flush()

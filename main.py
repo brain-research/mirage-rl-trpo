@@ -2,6 +2,7 @@ import argparse
 from itertools import count
 import functools
 
+import random
 import gym
 import scipy.optimize
 
@@ -15,6 +16,8 @@ from trpo import trpo_step
 import ipdb
 import sys
 import json
+import os
+import pickle
 
 torch.utils.backcompat.broadcast_warning.enabled = True
 torch.utils.backcompat.keepdim_warning.enabled = True
@@ -58,6 +61,10 @@ parser.add_argument('--v-optimizer', type=str, default='lbfgs',
                     help='which optimizer to use for the value function (default: lbfgs)')
 parser.add_argument('--use-disc-avg-v', action='store_true',
                     help='use discounted average value parameterization of the value function (default: False)')
+parser.add_argument('--checkpoint-dir', type=str, default=None,
+                    help='directory to write checkpoints to (default: None)')
+parser.add_argument('--checkpoint-interval', type=int, default=5, metavar='N',
+                    help='interval between saving model checkpoints (default: 5)')
 args = parser.parse_args()
 
 env = gym.make(args.env_name)
@@ -69,23 +76,21 @@ env.seed(args.seed)
 torch.manual_seed(args.seed)
 
 policy_net = Policy(num_inputs, num_actions)
-value_net = Value(num_inputs)
+value_net = Value(num_inputs, args.use_disc_avg_v)
 value_optim = torch.optim.Adam(value_net.parameters(),
                                lr=args.control_variate_lr)
 
-disc_avg_value_net = Value(num_inputs)
+# Create control variate nets
+def create_cv(num_inputs):
+  cv_net = Value(num_inputs)
+  cv_optim = torch.optim.Adam(cv_net.parameters(),
+                              lr=args.control_variate_lr)
+  return cv_net, cv_optim
 
-control_variate_net = Value(num_inputs)
-control_variate_optim = torch.optim.Adam(control_variate_net.parameters(),
-                                   lr=args.control_variate_lr)
-advantage_net = Value(num_inputs + num_actions)
-advantage_optim = torch.optim.Adam(advantage_net.parameters(),
-                                   lr=args.control_variate_lr)
-
-# 1 step environment model
-env_net = EnvModel(num_inputs + num_actions, num_inputs)
-env_optim = torch.optim.Adam(env_net.parameters(),
-                             lr=args.control_variate_lr/3)
+state_cv_net, state_cv_optim = create_cv(num_inputs)
+state_action_cv_net, state_action_cv_optim = create_cv(num_inputs + num_actions)
+gae_state_cv_net, gae_state_cv_optim = create_cv(num_inputs)
+gae_state_action_cv_net, gae_state_action_cv_optim = create_cv(num_inputs + num_actions)
 
 def select_action(state):
     state = torch.from_numpy(state).unsqueeze(0)
@@ -97,7 +102,8 @@ def select_action(state):
 
 def compute_values(value_net, states, discounted_time_left, use_disc_avg_v=False):
   if use_disc_avg_v:
-    return discounted_time_left * value_net(states)
+    state_value, disc_avg_state_value = value_net(states)
+    return state_value + discounted_time_left * disc_avg_state_value
   else:
     return value_net(states)
 
@@ -113,8 +119,11 @@ def update_params(batch):
 
     # Compute values and control variates
     values = compute_values(value_net, Variable(states), discounted_time_left, args.use_disc_avg_v)
-    control_variates = control_variate_net(Variable(states))
-    advantage_estimator = advantage_net(Variable(torch.cat(
+    state_cv_values = state_cv_net(Variable(states))
+    state_action_cv_values = state_action_cv_net(Variable(torch.cat(
+        (states, actions), dim=1)))
+    gae_state_cv_values = gae_state_cv_net(Variable(states))
+    gae_state_action_cv_values = gae_state_action_cv_net(Variable(torch.cat(
         (states, actions), dim=1)))
 
     returns = torch.Tensor(actions.size(0),1)
@@ -134,7 +143,7 @@ def update_params(batch):
         prev_advantage = advantages[i, 0]
 
     targets = Variable(returns)
-    control_variate_targets = Variable(advantages)
+    advantage_targets = Variable(advantages)
 
     # Original code uses the same LBFGS to optimize the value loss
     def get_value_loss(flat_params):
@@ -159,27 +168,20 @@ def update_params(batch):
     print('Mean advantages: %g' % (advantages.mean()))
     print('MSE returns: %g' % (returns.pow(2).mean()))
     print('MSE returns - values: %g' % ((returns - values.data).pow(2).mean()))
+    print('MSE returns - state CV: %g' % ((returns - values.data - state_cv_values.data).pow(2).mean()))
+    print('MSE returns - state-action CV: %g' % ((returns - values.data - state_action_cv_values.data).pow(2).mean()))
     print('MSE advantages: %g' % (advantages.pow(2).mean()))
-    print('MSE state baseline advantages: %g' % ((advantages - control_variates.data).pow(2).mean()))
-    print('MSE state-action baseline advantages: %g' % ((advantages - advantage_estimator.data).pow(2).mean()))
+    print('MSE advantages - state CV: %g' % ((advantages - gae_state_cv_values.data).pow(2).mean()))
+    print('MSE advanatages - state-action CV: %g' % ((advantages - gae_state_action_cv_values.data).pow(2).mean()))
 
     logging_info['mse_v_lbfgs'] = (returns - values.data).pow(2).mean()
     logging_info['mse_none'] = advantages.pow(2).mean()
-    logging_info['mse_v'] = (advantages - control_variates.data).pow(2).mean()
-    logging_info['mse_q'] = (advantages - advantage_estimator.data).pow(2).mean()
-
-    # Disable normalization of advantages
-    # advantages = (advantages - advantages.mean()) / advantages.std()
+    logging_info['mse_v'] = (advantages - gae_state_cv_values.data).pow(2).mean()
+    logging_info['mse_q'] = (advantages - gae_state_action_cv_values.data).pow(2).mean()
+    # End debug printing
 
     action_means, action_log_stds, action_stds = policy_net(Variable(states))
     fixed_log_prob = normal_log_density(Variable(actions), action_means, action_log_stds, action_stds).data.clone()
-
-    reward_hat, next_obs_delta_hat = env_net(Variable(torch.cat(
-        (states, actions), dim=1)))
-    next_obs_hat = Variable(states) + next_obs_delta_hat
-    # TODO: Fix time for 1 step in the future!
-    next_value_hat = compute_values(value_net, next_obs_hat, discounted_time_left, args.use_disc_avg_v)
-    disc_sum_reward_hat = reward_hat + args.gamma * next_value_hat
 
     def get_loss(volatile=False, baseline="none"):
         action_means, action_log_stds, action_stds = policy_net(Variable(states, volatile=volatile))
@@ -188,23 +190,13 @@ def update_params(batch):
         if baseline == "none":
           action_loss = -Variable(advantages) * torch.exp(log_prob - Variable(fixed_log_prob))
         elif baseline == "v":
-          action_loss = -(Variable(advantages) - control_variates.detach()) * torch.exp(log_prob - Variable(fixed_log_prob))
+          action_loss = -(Variable(advantages) - gae_state_cv_values.detach()) * torch.exp(log_prob - Variable(fixed_log_prob))
         elif baseline == "q":
           current_policy_action = action_means + Variable(epsilons) * action_stds
-          current_policy_advantage_estimator = advantage_net(torch.cat(
+          current_policy_gae_state_action_cv_values = gae_state_action_cv_net(torch.cat(
               (Variable(states), current_policy_action), dim=1))
-          action_loss = -((Variable(advantages) - advantage_estimator.detach()) * torch.exp(log_prob - Variable(fixed_log_prob))
-                          + current_policy_advantage_estimator)
-        elif baseline == "model":
-          current_policy_action = action_means + Variable(epsilons) * action_stds
-          current_policy_reward_hat, current_policy_next_obs_delta_hat = env_net(torch.cat(
-              (Variable(states), current_policy_action), dim=1))
-          current_policy_next_obs_hat = Variable(states) + current_policy_next_obs_delta_hat
-          current_policy_next_value_hat = value_net(current_policy_next_obs_hat)
-          current_policy_disc_sum_reward_hat = current_policy_reward_hat + args.gamma * current_policy_next_value_hat
-
-          action_loss = -((Variable(advantages) + values.detach() - disc_sum_reward_hat.detach()) * torch.exp(log_prob - Variable(fixed_log_prob))
-                          + current_policy_disc_sum_reward_hat)
+          action_loss = -((Variable(advantages) - gae_state_action_cv_values.detach()) * torch.exp(log_prob - Variable(fixed_log_prob))
+                          + current_policy_gae_state_action_cv_values)
         else:
           exit()
 
@@ -222,62 +214,24 @@ def update_params(batch):
 
     trpo_step(policy_net, functools.partial(get_loss, baseline=args.baseline), get_kl, args.max_kl, args.damping)
 
-    for baseline in ["none", "v", "q", "model"]:
-      loss = get_loss(baseline=baseline)
-      grads = torch.autograd.grad(loss, policy_net.parameters())
-      loss_grad_mse = torch.cat([grad.view(-1) for grad in grads]).data.pow(2).mean()
-
-      print("%s grad MSE: %g" % (baseline, loss_grad_mse))
-      logging_info['grad_mse_%s' % baseline] = loss_grad_mse
-
     # Update control variates
-
-    # state only baseline
-    detached_values = values.detach()
-    control_variate_loss_mse = None
-    control_variate_epochs = 25  # fixed for now, change LR to change learning dynamics
-    for _ in range(control_variate_epochs):
-      control_variates = control_variate_net(Variable(states))
-      control_variate_optim.zero_grad()
-      control_variate_loss = (control_variate_targets - control_variates).pow(2).mean()
-      #control_variate_loss = (targets - control_variates).pow(2).mean()
-      control_variate_loss.backward()
-      control_variate_optim.step()
-
-    # state-action baseline
-    advantage_net_loss_mse = None
-    for _ in range(control_variate_epochs):
-      advantage_estimator = advantage_net(Variable(torch.cat(
-        (states, actions), dim=1)))
-      advantage_optim.zero_grad()
-      #advantage_net_loss = (targets - detached_values - advantage_estimator).pow(2).mean()
-      advantage_net_loss = (control_variate_targets - advantage_estimator).pow(2).mean()
-      #advantage_net_loss = (targets - advantage_estimator).pow(2).mean()
-      advantage_net_loss.backward()
-      advantage_optim.step()
-
-    # 1-step model baseline
-    env_net_loss_mse = None
-    for _ in range(control_variate_epochs):
-      reward_hat, next_obs_delta_hat = env_net(Variable(torch.cat(
-        (states, actions), dim=1)))
-      next_obs_hat = Variable(states) + next_obs_delta_hat
-      # TODO: Fix discounted time left to account for 1 time step in the future!
-      next_value_hat = compute_values(value_net, next_obs_hat, discounted_time_left, args.use_disc_avg_v)
-      disc_sum_reward_hat = reward_hat + args.gamma * next_value_hat
-
-      env_optim.zero_grad()
-      #env_net_loss = (Variable(rewards) - reward_hat.view(-1)).pow(2).mean()
-      env_net_loss = (control_variate_targets + detached_values - disc_sum_reward_hat).pow(2).mean()
-      #env_net_loss = (targets - disc_sum_reward_hat).pow(2).mean()
-      env_net_loss.backward()
-      env_optim.step()
-
-      if env_net_loss_mse is None:
-        env_net_loss_mse = env_net_loss.data.numpy()
-        print('Env net MSE: %g' % env_net_loss_mse)
-        logging_info['mse_model'] = env_net_loss_mse[0]
-
+    def update_cv(cv_net, cv_optim, inputs, targets, n_epochs=25):
+      for _ in range(n_epochs):
+        cv_net_values = cv_net(inputs)
+        cv_optim.zero_grad()
+        cv_loss = (targets - cv_net_values).pow(2).mean()
+        cv_loss.backward()
+        cv_optim.step()
+    update_cv(state_cv_net, state_cv_optim,
+              Variable(states), targets - values.detach())
+    update_cv(state_action_cv_net, state_action_cv_optim,
+              Variable(torch.cat((states, actions), dim=1)),
+              targets - values.detach())
+    update_cv(gae_state_cv_net, gae_state_cv_optim,
+              Variable(states), advantage_targets)
+    update_cv(gae_state_action_cv_net, gae_state_action_cv_optim,
+              Variable(torch.cat((states, actions), dim=1)),
+              advantage_targets)
 
     # Update value function
     if args.v_optimizer == 'lbfgs':
@@ -293,28 +247,9 @@ def update_params(batch):
     else:
       exit()
 
-    # Deprecated:
-    # Update advantage net
-    # Recompute advanatages w/ the new values
-    #disc_avg_values = discounted_time_left * disc_avg_value_net(Variable(states))
-    #prev_return = 0
-    #prev_value = 0
-    #prev_advantage = 0
-    #for i in reversed(range(rewards.size(0))):
-    #    returns[i] = rewards[i] + args.gamma * prev_return * masks[i]
-    #    deltas[i] = rewards[i] + args.gamma * prev_value * masks[i] - disc_avg_values.data[i]
-    #    advantages[i] = deltas[i] + args.gamma * args.tau * prev_advantage * masks[i]
-
-    #    prev_return = returns[i, 0]
-    #    prev_value = disc_avg_values.data[i, 0]
-    #    prev_advantage = advantages[i, 0]
-    #control_variate_targets = Variable(advantages)
-
-
     return logging_info
 
 running_state = ZFilter((num_inputs,), clip=5)
-#running_reward = ZFilter((1,), demean=False, clip=10)
 
 if args.log_file is not None:
   log_file = open(args.log_file, 'w')
@@ -343,7 +278,7 @@ for i_episode in range(args.n_epochs):
             if done:
                 mask = 0
 
-            memory.push(state, np.array([action]), np.array([epsilon]), mask, next_state, reward, t)
+            memory.push(state, np.array([action]), np.array([epsilon]), mask, next_state, reward, t, None)
 
             if args.render:
                 env.render()
@@ -358,9 +293,6 @@ for i_episode in range(args.n_epochs):
     reward_batch /= num_episodes
     batch = memory.sample()
 
-    #if i_episode > 60:
-    #  ipdb.set_trace()
-
     logging_info = update_params(batch)
 
     if i_episode % args.log_interval == 0:
@@ -371,8 +303,27 @@ for i_episode in range(args.n_epochs):
         logging_info['reward_sum'] = reward_sum
         logging_info['reward_batch'] = reward_batch
         log_file.write('%s\n' % json.dumps(logging_info))
-        #'%d\t%g\t%g\n' % (i_episode, reward_sum, reward_batch))
         log_file.flush()
+
+    if args.checkpoint_dir is not None and i_episode % args.checkpoint_interval == 0:
+      print('Saving checkpoint')
+      nets = [('policy', policy_net),
+              ('value', value_net),
+              ('v', state_cv_net),
+              ('q', state_action_cv_net),
+              ('gae_v', gae_state_cv_net),
+              ('gae_q', gae_state_action_cv_net), ]
+      for (net_name, net) in nets:
+        torch.save(net.state_dict(), os.path.join(args.checkpoint_dir, '%s_%d.chkpt' % (net_name, i_episode)))
+      with open(os.path.join(args.checkpoint_dir, 'zfilter_%d.p' % i_episode), 'wb') as out:
+        pickle.dump(running_state, out)
+
+      # Save args on first episode
+      if i_episode == 0:
+        with open(os.path.join(args.checkpoint_dir, 'training_args.p'), 'wb') as out:
+          pickle.dump(args, out)
+
+
 
 if args.log_file is not None:
   log_file.close()

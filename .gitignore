@@ -1,1 +1,7 @@
+__pycache__/*
 gcp*-logs/*
+*.txt
+*.png
+*.pdf
+*.json
+chkpts/*

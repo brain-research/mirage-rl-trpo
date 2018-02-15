@@ -232,8 +232,8 @@ def calc_advantage_estimator(mujoco_state, action, time_left, epsilons=None):
 
   # Compute GAE estimator
   states = torch.Tensor(states)
-  time_left = args.max_time - torch.Tensor(times)
-  discounted_time_left = Variable((1 - torch.pow(args.gamma, time_left))/(1 - args.gamma)).view(-1, 1)
+  time_left_vector = time_left - torch.Tensor(times)
+  discounted_time_left = Variable((1 - torch.pow(args.gamma, time_left_vector))/(1 - args.gamma)).view(-1, 1)
 
   # Compute values and control variates
   values = compute_values(value_net, Variable(states), discounted_time_left, args.use_disc_avg_v)

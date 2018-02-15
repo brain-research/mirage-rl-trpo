@@ -43,6 +43,9 @@ eval_args = parser.parse_args()
 with open(os.path.join(eval_args.checkpoint_dir, 'training_args.p'), 'rb') as f:
   args = pickle.load(f)
 
+with open(os.path.join(eval_args.checkpoint_dir, 'zfilter_%d.p' % eval_args.checkpoint), 'rb') as f:
+  running_state = pickle.load(f)
+
 env = gym.make(args.env_name)
 
 num_inputs = env.observation_space.shape[0]
@@ -58,6 +61,7 @@ state_action_cv_net = Value(num_inputs + num_actions)
 gae_state_cv_net = Value(num_inputs)
 gae_state_action_cv_net = Value(num_inputs + num_actions)
 
+
 # Read in the networks
 nets = [('policy', policy_net),
         ('value', value_net),
@@ -67,7 +71,10 @@ nets = [('policy', policy_net),
         ('gae_q', gae_state_action_cv_net), ]
 
 for (net_name, net) in nets:
-  net.load_state_dict(torch.load(os.path.join(args.checkpoint_dir, '%s_%d.chkpt' % (net_name, eval_args.checkpoint))))
+  net.load_state_dict(torch.load(
+      os.path.join(args.checkpoint_dir,
+                   '%s_%d.chkpt' % (net_name,
+                                    eval_args.checkpoint))))
 
 def select_action(state, epsilon=None):
     state = torch.from_numpy(state).unsqueeze(0)
@@ -249,8 +256,6 @@ def calc_advantage_estimator(mujoco_state, action, time_left, epsilons=None):
 
   return returns[0], advantages[0]
 
-with open(os.path.join(eval_args.checkpoint_dir, 'zfilter_%d.p' % eval_args.checkpoint), 'rb') as f:
-  running_state = pickle.load(f)
 
 def get_batch(batch_size):
   memory = Memory()
@@ -264,6 +269,7 @@ def get_batch(batch_size):
 
       reward_sum = 0
       for t in range(args.max_time):
+          # Save the mujoco state so that we can reset.
           mujoco_state = env.env.get_state()
           action, epsilon = select_action(state)
           action = action.data[0].numpy()
@@ -277,7 +283,8 @@ def get_batch(batch_size):
           if done:
               mask = 0
 
-          memory.push(state, np.array([action]), np.array([epsilon]), mask, next_state, reward, t, mujoco_state)
+          memory.push(state, np.array([action]), np.array([epsilon]),
+                      mask, next_state, reward, t, mujoco_state)
 
           if done:
               break

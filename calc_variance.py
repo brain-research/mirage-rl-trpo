@@ -25,19 +25,18 @@ torch.utils.backcompat.keepdim_warning.enabled = True
 
 torch.set_default_tensor_type('torch.DoubleTensor')
 
+# Parse eval arguments
 parser = argparse.ArgumentParser(description='PyTorch actor-critic example')
 parser.add_argument('--seed', type=int, default=543, metavar='N',
                     help='random seed (default: 1)')
-parser.add_argument('--batch-size', type=int, default=15000, metavar='N',
-                    help='random seed (default: 1)')
-parser.add_argument('--baseline', type=str, default="none",
-                    help='baseline to use (default: none)')
-parser.add_argument('--log-file', type=str, default=None,
-                    help='log file to write to (default: None)')
 parser.add_argument('--checkpoint-dir', type=str, default=None,
                     help='directory to write checkpoints to (default: None)')
 parser.add_argument('--checkpoint', type=int, default=5, metavar='N',
-                    help='interval between saving model checkpoints (default: 5)')
+                    help='which checkpoint to evaluate')
+parser.add_argument('--n-epochs', type=int, default=5, metavar='N',
+                    help='how many times to repeat the entire process')
+parser.add_argument('--n-samples', type=int, default=5, metavar='N',
+                    help='how many samples to use per batch of data sampled')
 eval_args = parser.parse_args()
 
 # Load in checkpoint
@@ -91,56 +90,6 @@ def compute_values(value_net, states, discounted_time_left, use_disc_avg_v=False
 def vectorize(t):
   return torch.cat([x.view(-1) for x in t])
 
-def get_advantages(batch):
-  rewards = torch.Tensor(batch.reward)
-  masks = torch.Tensor(batch.mask)
-  actions = torch.Tensor(np.concatenate(batch.action, 0))
-  states = torch.Tensor(batch.state)
-  time_left = args.max_time - torch.Tensor(batch.time)
-  discounted_time_left = Variable((1 - torch.pow(args.gamma, time_left))/(1 - args.gamma)).view(-1, 1)
-
-  # Compute values and control variates
-  values = compute_values(value_net, Variable(states), discounted_time_left, args.use_disc_avg_v)
-
-  returns = torch.Tensor(actions.size(0),1)
-  deltas = torch.Tensor(actions.size(0),1)
-  advantages = torch.Tensor(actions.size(0),1)
-
-  prev_return = 0
-  prev_value = 0
-  prev_advantage = 0
-  for i in reversed(range(rewards.size(0))):
-      returns[i] = rewards[i] + args.gamma * prev_return * masks[i]
-      deltas[i] = rewards[i] + args.gamma * prev_value * masks[i] - values.data[i]
-      advantages[i] = deltas[i] + args.gamma * args.tau * prev_advantage * masks[i]
-
-      prev_return = returns[i, 0]
-      prev_value = values.data[i, 0]
-      prev_advantage = advantages[i, 0]
-
-  return advantages
-
-
-def get_policy_grad(batch):
-  # Policy gradient for an entire batch averaged over time steps
-  actions = torch.Tensor(np.concatenate(batch.action, 0))
-  states = torch.Tensor(batch.state)
-  advantages = get_advantages(batch)
-
-  action_means, action_log_stds, action_stds = policy_net(Variable(states))
-  fixed_log_prob = normal_log_density(Variable(actions), action_means, action_log_stds, action_stds).data.clone()
-
-  def get_loss(volatile=False):
-      action_means, action_log_stds, action_stds = policy_net(Variable(states, volatile=volatile))
-      log_prob = normal_log_density(Variable(actions), action_means, action_log_stds, action_stds)
-      action_loss = -Variable(advantages) * torch.exp(log_prob - Variable(fixed_log_prob))
-      return action_loss.mean()
-
-  loss = get_loss()
-  grad = torch.autograd.grad(loss, policy_net.parameters())
-  return vectorize(grad).data.numpy()
-
-
 def grad_log_pi(state, action):
   # Compute \nabla \log \pi (action | state) for a single time step
   state = Variable(torch.Tensor(state).view(1, -1))
@@ -180,7 +129,7 @@ def compute_estimators(q_x, q_y, q, v_x, v_y, value_func_est, q_func_est, q_func
   return var_term_1, var_term_2, var_term_2_value_func_est_baseline, var_term_2_q_func_est_baseline, var_term_2_value_baseline, var_term_3
 
 
-def estimate_variance(batch, n_samples=50):
+def estimate_variance(batch, n_samples):
   actions = np.concatenate(batch.action, 0)
   epsilons = torch.Tensor(np.concatenate(batch.epsilon, 0))
   states = batch.state
@@ -343,20 +292,12 @@ def get_batch(batch_size):
 
   return reward_batch, reward_sum, batch
 
-for i_episode in range(40): #eval_args.n_epochs):
-  batch_size = args.batch_size
-  #_, _, batch = get_batch(batch_size)
-  #g_mu_1 = get_policy_grad(batch)
-
-  #_, _, batch = get_batch(batch_size)
-  #g_mu_2 = get_policy_grad(batch)
-
-  # Compute variance
-  reward_batch, _, batch = get_batch(batch_size)
-  #print(reward_batch)
-  var_hat = estimate_variance(batch,
-                              n_samples=50)
-  #print(np.mean((vectorize(g_mu_1) * vectorize(g_mu_2)).data.numpy()))
-
-  print(json.dumps([eval_args.checkpoint, var_hat.tolist()]))
-  sys.stdout.flush()
+if __name__ == '__main__':
+  for _ in range(eval_args.n_epochs):
+    reward_batch, _, batch = get_batch(args.batch_size)
+    var_hat = estimate_variance(batch,
+                                n_samples=eval_args.n_samples)
+    print(json.dumps([eval_args.checkpoint,
+                      reward_batch,
+                      var_hat.tolist()]))
+    sys.stdout.flush()

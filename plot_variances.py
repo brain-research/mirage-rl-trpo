@@ -12,7 +12,7 @@ import matplotlib.patches as mpatches
 color_list = sns.color_palette("muted")
 sns.palplot(color_list)
 
-def plot(log_file, title, smoother=None, gae=True, legend=True):
+def plot(log_file, title, smoother=None, gae=True):
   with open(log_file, 'r') as f:
     variances = {}
 
@@ -54,16 +54,11 @@ def plot(log_file, title, smoother=None, gae=True, legend=True):
   plt.yscale('log', nonposy='clip')
   plt.ylabel('Variance', fontsize=16)
   plt.xlabel('Steps (thousands)', fontsize=16)
-  options = ''
+
   if gae:
     plt.title(title + ' (GAE)', fontsize=18)
-    options += '_gae'
   else:
     plt.title(title, fontsize=18)
-  if legend:
-    plt.legend(handles=legend_handles, loc='lower center', ncol=4, prop={'size': 10})
-    #plt.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=16)
-    options += '_l'
 
   plt.grid(alpha=0.5)
   return legend_handles
@@ -91,14 +86,12 @@ if __name__ == '__main__':
                         title=title,
                         smoother=smoother,
                         gae=False,
-                        legend=False,
                         )
   plt.subplot(1, 2, 2)
   legend_handles = plot(log_file,
                         title=title,
                         smoother=smoother,
                         gae=True,
-                        legend=False,
                         )
 
   plt.legend(handles=legend_handles,

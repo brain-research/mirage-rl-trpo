@@ -26,7 +26,7 @@ torch.utils.backcompat.keepdim_warning.enabled = True
 torch.set_default_tensor_type('torch.DoubleTensor')
 
 # Parse eval arguments
-parser = argparse.ArgumentParser(description='PyTorch actor-critic example')
+parser = argparse.ArgumentParser(description='Compute the variance terms')
 parser.add_argument('--seed', type=int, default=543, metavar='N',
                     help='random seed (default: 1)')
 parser.add_argument('--checkpoint-dir', type=str, default=None,
@@ -120,7 +120,7 @@ def compute_estimators(q_x, q_y, q, v_x, v_y, value_func_est, q_func_est, q_func
                                        (q_y - q_func_est)*
                                        sq_shared_grad_log_pi)
 
-  # Might as well use the value estimates to reduce the variance of this term
+  # Use the value estimates to reduce the variance of this term
   term_3 = np.mean((q_x - v_x)*(q - v_y)*shared_grad_log_pi * unshared_grad_log_pi +
                    (q - v_x)*(q_y - v_y)*shared_grad_log_pi * unshared_grad_log_pi)/2
   term_3_q_func_est_baseline = np.mean((q_x - q_func_est)*(q - q_func_est_prime)*shared_grad_log_pi * unshared_grad_log_pi +
@@ -131,9 +131,12 @@ def compute_estimators(q_x, q_y, q, v_x, v_y, value_func_est, q_func_est, q_func
   var_term_2_value_func_est_baseline = term_2_value_func_est_baseline - term_3
   var_term_2_q_func_est_baseline = term_2_q_func_est_baseline - term_3_q_func_est_baseline
   var_term_2_value_baseline = term_2_value_baseline - term_3
-  var_term_3 = term_3 # - E[g]^2 which is small, so this is an upper bound
+  var_term_3 = term_3 # - E[g]^2 which is small. Without that term, it is an upper bound
 
-  return var_term_1, var_term_2, var_term_2_value_func_est_baseline, var_term_2_q_func_est_baseline, var_term_2_value_baseline, var_term_3
+  return (var_term_1,
+          var_term_2, var_term_2_value_func_est_baseline,
+          var_term_2_q_func_est_baseline, var_term_2_value_baseline,
+          var_term_3)
 
 
 def estimate_variance(batch, n_samples):

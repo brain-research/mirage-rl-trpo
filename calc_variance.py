@@ -72,7 +72,7 @@ nets = [('policy', policy_net),
 
 for (net_name, net) in nets:
   net.load_state_dict(torch.load(
-      os.path.join(args.checkpoint_dir,
+      os.path.join(eval_args.checkpoint_dir,
                    '%s_%d.chkpt' % (net_name,
                                     eval_args.checkpoint))))
 
@@ -143,7 +143,7 @@ def estimate_variance(batch, n_samples):
   n_steps = len(batch.state)
 
   def _select_action(state):
-    a, _ = select_action(s)
+    a, _ = select_action(state)
     a = a.data[0].numpy()
     return a
 
@@ -159,7 +159,8 @@ def estimate_variance(batch, n_samples):
     discounted_time_left = (1. - args.gamma ** time_left) / (1. - args.gamma)
 
     # Compute function approximators
-    value_func_base_est = compute_values(value_net, Variable(torch.Tensor(s)),
+    value_func_base_est = compute_values(value_net,
+                                         Variable(torch.Tensor(s)),
                                          Variable(torch.Tensor([discounted_time_left])),
                                          args.use_disc_avg_v).data.numpy()[0]
     value_func_est = value_func_base_est + state_cv_net(Variable(torch.Tensor(s))).data.numpy()[0]
@@ -167,7 +168,8 @@ def estimate_variance(batch, n_samples):
 
     q_func_est = value_func_base_est + state_action_cv_net(
         Variable(torch.cat([torch.Tensor(s), torch.Tensor(a)]))).data.numpy()[0]
-    gae_q_func_est = gae_state_action_cv_net(Variable(torch.cat([torch.Tensor(s), torch.Tensor(a)]))).data.numpy()[0]
+    gae_q_func_est = gae_state_action_cv_net(
+        Variable(torch.cat([torch.Tensor(s), torch.Tensor(a)]))).data.numpy()[0]
 
     shared_grad_log_pi = grad_log_pi(s, a)
 
@@ -185,9 +187,10 @@ def estimate_variance(batch, n_samples):
     q, gae_q = calc_advantage_estimator(mujoco_state, a, time_left)
     unshared_grad_log_pi = grad_log_pi(s, a)
 
-    q_func_est_prime = value_func_est + state_action_cv_net(
+    q_func_est_prime = value_func_base_est + state_action_cv_net(
         Variable(torch.cat([torch.Tensor(s), torch.Tensor(a)]))).data.numpy()[0]
-    gae_q_func_est_prime = gae_state_action_cv_net(Variable(torch.cat([torch.Tensor(s), torch.Tensor(a)]))).data.numpy()[0]
+    gae_q_func_est_prime = gae_state_action_cv_net(
+        Variable(torch.cat([torch.Tensor(s), torch.Tensor(a)]))).data.numpy()[0]
 
     variance_hats.append(
         compute_estimators(q_x, q_y, q, v_x, v_y,

@@ -17,7 +17,7 @@ def plot(log_file, title, smoother=None, gae=True, legend=True):
     variances = {}
 
     for line in f:
-      episode, variance = json.loads(line.strip())
+      episode, reward, variance = json.loads(line.strip())
       if episode not in variances:
         variances[episode] = []
       variances[episode].append(variance)
@@ -39,7 +39,7 @@ def plot(log_file, title, smoother=None, gae=True, legend=True):
       index += 6
 
     # Smooth, clip, log y
-    processor = lambda y: np.log(np.clip(smoother(y), 1e-3, 1e6))
+    processor = lambda y: np.clip(smoother(y), 1e-3, None)
 
     plot_y = processor(y_mu[:, index])
     plot_y_upper = processor(y_mu[:, index] + 2*y_std[:, index])
@@ -51,7 +51,8 @@ def plot(log_file, title, smoother=None, gae=True, legend=True):
     legend_handles.append(mpatches.Patch(color=color_list[i], label=label))
 
   plt.tick_params(labelsize=11)
-  plt.ylabel('ln(Variance)', fontsize=16)
+  plt.yscale('log', nonposy='clip')
+  plt.ylabel('Variance', fontsize=16)
   plt.xlabel('Steps (thousands)', fontsize=16)
   options = ''
   if gae:
@@ -67,7 +68,7 @@ def plot(log_file, title, smoother=None, gae=True, legend=True):
   plt.grid(alpha=0.5)
   return legend_handles
 
-def ema(x, alpha=0.9):
+def ema(x, alpha=0.95):
   res = []
   mu = 0.
   for val in x:
@@ -78,13 +79,11 @@ def ema(x, alpha=0.9):
 
 if __name__ == '__main__':
   log_file = sys.argv[1]
-
-  #title='HalfCheetah-v1'
-  #title='Humanoid-v1'
   title=sys.argv[2]
+
   smoother=lambda x: x
-  #smoother=lambda x: savgol_filter(x, 21, 1)
   #smoother=lambda x: ema(x)
+  #smoother=lambda x: savgol_filter(x, 21, 1)
 
   fig = plt.figure(figsize=(20,6))
   plt.subplot(1, 2, 1)
@@ -107,7 +106,5 @@ if __name__ == '__main__':
              ncol=6,
              prop={'size': 20})
 
-  #plt.legend(handles=legend_handles, loc='lower center', ncol=4, prop={'size': 10})
-  plt.savefig('%s_variance.pdf' % title, bbox_inches='tight')
-  #plt.savefig('%s_variance_gae.png' % title, bbox_inches='tight')
+  plt.savefig('plots/variance/%s_variance.pdf' % title, bbox_inches='tight')
 

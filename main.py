@@ -1,4 +1,5 @@
 import argparse
+import pdb
 from itertools import count
 import functools
 
@@ -60,6 +61,8 @@ parser.add_argument('--v-optimizer', type=str, default='lbfgs',
                     help='which optimizer to use for the value function (default: lbfgs)')
 parser.add_argument('--use-disc-avg-v', action='store_true',
                     help='use discounted average value parameterization of the value function (default: False)')
+parser.add_argument('--use-simple-disc-avg-v', action='store_true',
+                    help='use simple formulation of discounted value function (default: False)')
 parser.add_argument('--checkpoint-dir', type=str, default=None,
                     help='directory to write checkpoints to (default: None)')
 parser.add_argument('--checkpoint-interval', type=int, default=5, metavar='N',
@@ -80,16 +83,20 @@ value_optim = torch.optim.Adam(value_net.parameters(),
                                lr=args.control_variate_lr)
 
 # Create control variate nets
-def create_cv(num_inputs):
-  cv_net = Value(num_inputs)
+def create_cv(num_inputs, use_disc_avg_v):
+  cv_net = Value(num_inputs, use_disc_avg_v)
   cv_optim = torch.optim.Adam(cv_net.parameters(),
                               lr=args.control_variate_lr)
   return cv_net, cv_optim
 
-state_cv_net, state_cv_optim = create_cv(num_inputs)
-state_action_cv_net, state_action_cv_optim = create_cv(num_inputs + num_actions)
-gae_state_cv_net, gae_state_cv_optim = create_cv(num_inputs)
-gae_state_action_cv_net, gae_state_action_cv_optim = create_cv(num_inputs + num_actions)
+state_cv_net, state_cv_optim = create_cv(num_inputs, False)
+state_action_cv_net, state_action_cv_optim = create_cv(num_inputs + num_actions, False)
+
+gae_state_cv_net, gae_state_cv_optim = create_cv(num_inputs, False)
+gae_state_h0_cv_net, gae_state_h0_cv_optim = create_cv(num_inputs+1, False)
+gae_state_h1_cv_net, gae_state_h1_cv_optim = create_cv(num_inputs, True)
+
+gae_state_action_cv_net, gae_state_action_cv_optim = create_cv(num_inputs + num_actions, False)
 
 def select_action(state):
     state = torch.from_numpy(state).unsqueeze(0)
@@ -114,16 +121,18 @@ def update_params(batch):
     epsilons = torch.Tensor(np.concatenate(batch.epsilon, 0))
     states = torch.Tensor(batch.state)
     time_left = args.max_time - torch.Tensor(batch.time)
+    etime_left = time_left.view(time_left.shape[0], 1)
     discounted_time_left = Variable((1 - torch.pow(args.gamma, time_left))/(1 - args.gamma)).view(-1, 1)
+    time_states = torch.cat((states, etime_left), 1)
 
     # Compute values and control variates
     values = compute_values(value_net, Variable(states), discounted_time_left, args.use_disc_avg_v)
-    state_cv_values = state_cv_net(Variable(states))
-    state_action_cv_values = state_action_cv_net(Variable(torch.cat(
-        (states, actions), dim=1)))
+    # state_cv_values = state_cv_net(Variable(states))
+    # state_action_cv_values = state_action_cv_net(Variable(torch.cat((states, actions), dim=1)))
     gae_state_cv_values = gae_state_cv_net(Variable(states))
-    gae_state_action_cv_values = gae_state_action_cv_net(Variable(torch.cat(
-        (states, actions), dim=1)))
+    gae_state_h0_cv_values = gae_state_h0_cv_net(Variable(time_states))
+    gae_state_h1_cv_values = compute_values(gae_state_h1_cv_net, Variable(states), discounted_time_left, True)
+    # gae_state_action_cv_values = gae_state_action_cv_net(Variable(torch.cat( (states, actions), dim=1)))
 
     returns = torch.Tensor(actions.size(0),1)
     deltas = torch.Tensor(actions.size(0),1)
@@ -161,22 +170,43 @@ def update_params(batch):
         value_loss.backward()
         return (value_loss.data.double().numpy()[0], get_flat_grad_from(value_net).data.double().numpy())
 
+    # Original code uses the same LBFGS to optimize the value loss
+    def get_cv_loss(flat_params, cv_net, inputs, targets):
+        set_flat_params_to(cv_net, torch.Tensor(flat_params))
+        for param in cv_net.parameters():
+            if param.grad is not None:
+                param.grad.data.fill_(0)
+
+        values_ = compute_values(cv_net, inputs, discounted_time_left, cv_net == gae_state_h1_cv_net)
+
+        cv_loss = (values_ - targets).pow(2).mean()
+
+        # weight decay
+        for param in cv_net.parameters():
+            cv_loss += param.pow(2).sum() * args.l2_reg
+        cv_loss.backward()
+        return (cv_loss.data.double().numpy()[0], get_flat_grad_from(cv_net).data.double().numpy())
+
     #
     # Print debugging values
     #
     print('Mean advantages: %g' % (advantages.mean()))
-    print('MSE returns: %g' % (returns.pow(2).mean()))
-    print('MSE returns - values: %g' % ((returns - values.data).pow(2).mean()))
-    print('MSE returns - state CV: %g' % ((returns - values.data - state_cv_values.data).pow(2).mean()))
-    print('MSE returns - state-action CV: %g' % ((returns - values.data - state_action_cv_values.data).pow(2).mean()))
+    # print('MSE returns: %g' % (returns.pow(2).mean()))
+    # print('MSE returns - values: %g' % ((returns - values.data).pow(2).mean()))
+    # print('MSE returns - state CV: %g' % ((returns - values.data - state_cv_values.data).pow(2).mean()))
+    # print('MSE returns - state-action CV: %g' % ((returns - values.data - state_action_cv_values.data).pow(2).mean()))
     print('MSE advantages: %g' % (advantages.pow(2).mean()))
     print('MSE advantages - state CV: %g' % ((advantages - gae_state_cv_values.data).pow(2).mean()))
-    print('MSE advanatages - state-action CV: %g' % ((advantages - gae_state_action_cv_values.data).pow(2).mean()))
+    print('MSE advantages - state H0 CV: %g' % ((advantages - gae_state_h0_cv_values.data).pow(2).mean()))
+    print('MSE advantages - state H1 CV: %g' % ((advantages - gae_state_h1_cv_values.data).pow(2).mean()))
+    # print('MSE advanatages - state-action CV: %g' % ((advantages - gae_state_action_cv_values.data).pow(2).mean()))
 
-    logging_info['mse_v_lbfgs'] = (returns - values.data).pow(2).mean()
+    # logging_info['mse_v_lbfgs'] = (returns - values.data).pow(2).mean()
     logging_info['mse_none'] = advantages.pow(2).mean()
     logging_info['mse_v'] = (advantages - gae_state_cv_values.data).pow(2).mean()
-    logging_info['mse_q'] = (advantages - gae_state_action_cv_values.data).pow(2).mean()
+    logging_info['mse_h0'] = (advantages - gae_state_h0_cv_values.data).pow(2).mean()
+    logging_info['mse_h1'] = (advantages - gae_state_h1_cv_values.data).pow(2).mean()
+    # logging_info['mse_q'] = (advantages - gae_state_action_cv_values.data).pow(2).mean()
     # End debug printing
 
     action_means, action_log_stds, action_stds = policy_net(Variable(states))
@@ -190,6 +220,10 @@ def update_params(batch):
           action_loss = -Variable(advantages) * torch.exp(log_prob - Variable(fixed_log_prob))
         elif baseline == "v":
           action_loss = -(Variable(advantages) - gae_state_cv_values.detach()) * torch.exp(log_prob - Variable(fixed_log_prob))
+        elif baseline == "vh0":
+          action_loss = -(Variable(advantages) - gae_state_h0_cv_values.detach()) * torch.exp(log_prob - Variable(fixed_log_prob))
+        elif baseline == "vh1":
+          action_loss = -(Variable(advantages) - gae_state_h1_cv_values.detach()) * torch.exp(log_prob - Variable(fixed_log_prob))
         elif baseline == "q":
           current_policy_action = action_means + Variable(epsilons) * action_stds
           current_policy_gae_state_action_cv_values = gae_state_action_cv_net(torch.cat(
@@ -215,42 +249,36 @@ def update_params(batch):
 
     # Update control variates
     def update_cv(cv_net, cv_optim, inputs, targets, n_epochs=25):
-      for _ in range(n_epochs):
-        cv_net_values = cv_net(inputs)
-        cv_optim.zero_grad()
-        cv_loss = (targets - cv_net_values).pow(2).mean()
-        cv_loss.backward()
-        cv_optim.step()
-    update_cv(state_cv_net, state_cv_optim,
-              Variable(states), targets - values.detach())
-    update_cv(state_action_cv_net, state_action_cv_optim,
-              Variable(torch.cat((states, actions), dim=1)),
-              targets - values.detach())
-    update_cv(gae_state_cv_net, gae_state_cv_optim,
-              Variable(states), advantage_targets)
-    update_cv(gae_state_action_cv_net, gae_state_action_cv_optim,
-              Variable(torch.cat((states, actions), dim=1)),
-              advantage_targets)
+      if args.v_optimizer == 'lbfgs':
+        flat_params, _, opt_info = scipy.optimize.fmin_l_bfgs_b(get_cv_loss, get_flat_params_from(cv_net), args=(cv_net, inputs, targets), maxiter=25) # Check that this does the right thing?
+        set_flat_params_to(cv_net, torch.Tensor(flat_params))
+      elif args.v_optimizer == 'adam':
+        for _ in range(n_epochs):
+          cv_net_values = cv_net(inputs)
+          cv_optim.zero_grad()
+          cv_loss = (targets - cv_net_values).pow(2).mean()
+          cv_loss.backward()
+          cv_optim.step()
 
-    # Update value function
-    if args.v_optimizer == 'lbfgs':
-      flat_params, _, opt_info = scipy.optimize.fmin_l_bfgs_b(get_value_loss, get_flat_params_from(value_net).double().numpy(), maxiter=25)
-      set_flat_params_to(value_net, torch.Tensor(flat_params))
-    elif args.v_optimizer == 'adam':
-      for _ in range(control_variate_epochs):
-        new_values = compute_values(value_net, Variable(states), discounted_time_left, args.use_disc_avg_v)
-        value_optim.zero_grad()
-        value_loss = (targets - new_values).pow(2).mean()
-        value_loss.backward()
-        value_optim.step()
-    else:
-      exit()
+    # update_cv(state_cv_net, state_cv_optim, Variable(states), targets - values.detach())
+    # update_cv(state_action_cv_net, state_action_cv_optim, Variable(torch.cat((states, actions), dim=1)), targets - values.detach())
+
+    update_cv(gae_state_cv_net, gae_state_cv_optim, Variable(states), advantage_targets)
+    update_cv(gae_state_h0_cv_net, gae_state_h0_cv_optim, Variable(time_states), advantage_targets)
+    update_cv(gae_state_h1_cv_net, gae_state_h1_cv_optim, Variable(states), advantage_targets)
 
     return logging_info
 
 running_state = ZFilter((num_inputs,), clip=5)
 
 if args.log_file is not None:
+  if not os.path.exists(os.path.dirname(args.log_file)):
+    try:
+      os.makedirs(os.path.dirname(args.log_file))
+    except OSError as exc:
+      if exc.errno != errno.EEXIST:
+        raise
+
   log_file = open(args.log_file, 'w')
 
 for i_episode in range(args.n_epochs):
@@ -311,6 +339,8 @@ for i_episode in range(args.n_epochs):
               ('v', state_cv_net),
               ('q', state_action_cv_net),
               ('gae_v', gae_state_cv_net),
+              ('gae_vh0', gae_state_h0_cv_net),
+              ('gae_vh1', gae_state_h1_cv_net),
               ('gae_q', gae_state_action_cv_net), ]
       for (net_name, net) in nets:
         torch.save(net.state_dict(), os.path.join(args.checkpoint_dir, '%s_%d.chkpt' % (net_name, i_episode)))

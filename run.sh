@@ -1,6 +1,8 @@
 #!/bin/bash
 
-ENV="HalfCheetah-v1"
+ENV="HalfCheetah-v2"
+ENV="Walker2d-v2"
+ENV="Humanoid-v2"
 
 #for SEED in `seq 1 5`
 #do
@@ -13,9 +15,15 @@ ENV="HalfCheetah-v1"
 #  done
 #done
 
+# Baselines to try: 'none', 'v', 'vh0', 'vh1'
+# Envs to try: 'HalfCheetah', 'Walker', Humanoid'
+# Batch size: 25000
+# Tau: 1.00
 
-for SEED in `seq 1 5`
+# for SEED in `seq 1 5`
+for SEED in `seq 1 1`
 do
-  BASELINE=none
-  python main.py --env-name $ENV --gamma 0.99 --tau 0.95 --baseline $BASELINE --n-epochs 250 --max-time 1000 --seed $SEED --log-file logs/halfcheetah/${BASELINE}_disc_${SEED}.txt
+  BASELINE=vh0
+  # python main.py --env-name $ENV --gamma 0.99 --tau 0.95 --baseline $BASELINE --n-epochs 250 --max-time 1000 --seed $SEED --log-file logs/halfcheetah/${BASELINE}_disc_${SEED}.txt
+  python main.py --env-name $ENV --gamma 0.99 --tau 1.00 --baseline $BASELINE --batch-size 25000 --n-epochs 50 --max-time 1000 --seed $SEED --log-file logs/${ENV}/${BASELINE}/sample.txt
 done

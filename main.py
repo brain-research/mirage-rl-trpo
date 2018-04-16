@@ -250,7 +250,7 @@ def update_params(batch):
     # Update control variates
     def update_cv(cv_net, cv_optim, inputs, targets, n_epochs=25):
       if args.v_optimizer == 'lbfgs':
-        flat_params, _, opt_info = scipy.optimize.fmin_l_bfgs_b(get_cv_loss, get_flat_params_from(cv_net), args=(cv_net, inputs, targets), maxiter=25) # Check that this does the right thing?
+        flat_params, _, opt_info = scipy.optimize.fmin_l_bfgs_b(get_cv_loss, get_flat_params_from(cv_net).double().numpy(), args=(cv_net, inputs, targets), maxiter=25) # Check that this does the right thing?
         set_flat_params_to(cv_net, torch.Tensor(flat_params))
       elif args.v_optimizer == 'adam':
         for _ in range(n_epochs):

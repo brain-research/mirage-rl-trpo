@@ -1,5 +1,5 @@
 
-ENV="Walker2d-v2"
+ENV="Walker2d-v1"
 BASELINE1="vh0"
 BASELINE2="vh1"
 

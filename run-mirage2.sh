@@ -1,5 +1,5 @@
 
-ENV="HalfCheetah-v2"
+ENV="HalfCheetah-v1"
 BASELINE1="none"
 BASELINE2="v"
 

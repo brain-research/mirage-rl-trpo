@@ -1,8 +1,8 @@
 #!/bin/bash
 
-ENV="HalfCheetah-v2"
 ENV="Walker2d-v2"
 ENV="Humanoid-v2"
+ENV="HalfCheetah-v2"
 
 #for SEED in `seq 1 5`
 #do

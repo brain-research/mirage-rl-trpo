@@ -1,5 +1,5 @@
 
-ENV="Humanoid-v2"
+ENV="Humanoid-v1"
 BASELINE1="none"
 BASELINE2="v"
 

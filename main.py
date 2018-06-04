@@ -53,16 +53,12 @@ parser.add_argument('--log-interval', type=int, default=1, metavar='N',
                     help='interval between training status logs (default: 10)')
 parser.add_argument('--control-variate-lr', type=float, default=3e-4, metavar='G',
                     help='control variate learning rate')
-parser.add_argument('--baseline', type=str, default="none",
+parser.add_argument('--baseline', type=str, default="v",
                     help='baseline to use (default: none)')
 parser.add_argument('--log-file', type=str, default=None,
                     help='log file to write to (default: None)')
 parser.add_argument('--v-optimizer', type=str, default='lbfgs',
                     help='which optimizer to use for the value function (default: lbfgs)')
-parser.add_argument('--use-disc-avg-v', action='store_true',
-                    help='use discounted average value parameterization of the value function (default: False)')
-parser.add_argument('--use-simple-disc-avg-v', action='store_true',
-                    help='use simple formulation of discounted value function (default: False)')
 parser.add_argument('--checkpoint-dir', type=str, default=None,
                     help='directory to write checkpoints to (default: None)')
 parser.add_argument('--checkpoint-interval', type=int, default=5, metavar='N',
@@ -78,25 +74,15 @@ env.seed(args.seed)
 torch.manual_seed(args.seed)
 
 policy_net = Policy(num_inputs, num_actions)
-value_net = Value(num_inputs, args.use_disc_avg_v)
-value_optim = torch.optim.Adam(value_net.parameters(),
-                               lr=args.control_variate_lr)
-
 # Create control variate nets
-def create_cv(num_inputs, use_disc_avg_v):
-  cv_net = Value(num_inputs, use_disc_avg_v)
-  cv_optim = torch.optim.Adam(cv_net.parameters(),
-                              lr=args.control_variate_lr)
-  return cv_net, cv_optim
-
-state_cv_net, state_cv_optim = create_cv(num_inputs, False)
-state_action_cv_net, state_action_cv_optim = create_cv(num_inputs + num_actions, False)
-
-gae_state_cv_net, gae_state_cv_optim = create_cv(num_inputs, False)
-gae_state_h0_cv_net, gae_state_h0_cv_optim = create_cv(num_inputs+1, False)
-gae_state_h1_cv_net, gae_state_h1_cv_optim = create_cv(num_inputs, True)
-
-gae_state_action_cv_net, gae_state_action_cv_optim = create_cv(num_inputs + num_actions, False)
+value_nets = {
+    #'zero': lambda x, y: Variable(0.),
+    'v': Value(num_inputs, False),
+    'horizon_v': Value(num_inputs, True),
+    'time_v': TimeValue(num_inputs, False),
+    #'time_horizon_v': TimeValue(num_inputs, True),
+}
+value_net = value_nets[args.baseline]
 
 def select_action(state):
     state = torch.from_numpy(state).unsqueeze(0)
@@ -106,13 +92,6 @@ def select_action(state):
     action = action_mean + epsilon * action_std
     return action, epsilon
 
-def compute_values(value_net, states, discounted_time_left, use_disc_avg_v=False):
-  if use_disc_avg_v:
-    state_value, disc_avg_state_value = value_net(states)
-    return state_value + discounted_time_left * disc_avg_state_value
-  else:
-    return value_net(states)
-
 def update_params(batch):
     logging_info = {}
     rewards = torch.Tensor(batch.reward)
@@ -121,18 +100,11 @@ def update_params(batch):
     epsilons = torch.Tensor(np.concatenate(batch.epsilon, 0))
     states = torch.Tensor(batch.state)
     time_left = args.max_time - torch.Tensor(batch.time)
-    etime_left = time_left.view(time_left.shape[0], 1)
-    discounted_time_left = Variable((1 - torch.pow(args.gamma, time_left))/(1 - args.gamma)).view(-1, 1)
-    time_states = torch.cat((states, etime_left), 1)
+    discounted_time_left = (1 - torch.pow(args.gamma, time_left))/(1 - args.gamma)
+    discounted_time_left = Variable(discounted_time_left).view(-1, 1)
 
     # Compute values and control variates
-    values = compute_values(value_net, Variable(states), discounted_time_left, args.use_disc_avg_v)
-    # state_cv_values = state_cv_net(Variable(states))
-    # state_action_cv_values = state_action_cv_net(Variable(torch.cat((states, actions), dim=1)))
-    gae_state_cv_values = gae_state_cv_net(Variable(states))
-    gae_state_h0_cv_values = gae_state_h0_cv_net(Variable(time_states))
-    gae_state_h1_cv_values = compute_values(gae_state_h1_cv_net, Variable(states), discounted_time_left, True)
-    # gae_state_action_cv_values = gae_state_action_cv_net(Variable(torch.cat( (states, actions), dim=1)))
+    values = value_net(Variable(states), discounted_time_left)
 
     returns = torch.Tensor(actions.size(0),1)
     deltas = torch.Tensor(actions.size(0),1)
@@ -154,14 +126,13 @@ def update_params(batch):
     advantage_targets = Variable(advantages)
 
     # Original code uses the same LBFGS to optimize the value loss
-    def get_value_loss(flat_params):
+    def get_value_loss(flat_params, value_net):
         set_flat_params_to(value_net, torch.Tensor(flat_params))
         for param in value_net.parameters():
             if param.grad is not None:
                 param.grad.data.fill_(0)
 
-        values_ = compute_values(value_net, Variable(states), discounted_time_left, args.use_disc_avg_v)
-
+        values_ = value_net(Variable(states), discounted_time_left)
         value_loss = (values_ -  targets).pow(2).mean()
 
         # weight decay
@@ -170,71 +141,28 @@ def update_params(batch):
         value_loss.backward()
         return (value_loss.data.double().numpy()[0], get_flat_grad_from(value_net).data.double().numpy())
 
-    # Original code uses the same LBFGS to optimize the value loss
-    def get_cv_loss(flat_params, cv_net, inputs, targets):
-        set_flat_params_to(cv_net, torch.Tensor(flat_params))
-        for param in cv_net.parameters():
-            if param.grad is not None:
-                param.grad.data.fill_(0)
-
-        values_ = compute_values(cv_net, inputs, discounted_time_left, cv_net == gae_state_h1_cv_net)
-
-        cv_loss = (values_ - targets).pow(2).mean()
-
-        # weight decay
-        for param in cv_net.parameters():
-            cv_loss += param.pow(2).sum() * args.l2_reg
-        cv_loss.backward()
-        return (cv_loss.data.double().numpy()[0], get_flat_grad_from(cv_net).data.double().numpy())
-
     #
     # Print debugging values
     #
-    print('Mean advantages: %g' % (advantages.mean()))
-    # print('MSE returns: %g' % (returns.pow(2).mean()))
-    # print('MSE returns - values: %g' % ((returns - values.data).pow(2).mean()))
-    # print('MSE returns - state CV: %g' % ((returns - values.data - state_cv_values.data).pow(2).mean()))
-    # print('MSE returns - state-action CV: %g' % ((returns - values.data - state_action_cv_values.data).pow(2).mean()))
-    print('MSE advantages: %g' % (advantages.pow(2).mean()))
-    print('MSE advantages - state CV: %g' % ((advantages - gae_state_cv_values.data).pow(2).mean()))
-    print('MSE advantages - state H0 CV: %g' % ((advantages - gae_state_h0_cv_values.data).pow(2).mean()))
-    print('MSE advantages - state H1 CV: %g' % ((advantages - gae_state_h1_cv_values.data).pow(2).mean()))
-    # print('MSE advanatages - state-action CV: %g' % ((advantages - gae_state_action_cv_values.data).pow(2).mean()))
+    print('MSE returns: %g' % (returns.pow(2).mean()))
 
-    # logging_info['mse_v_lbfgs'] = (returns - values.data).pow(2).mean()
-    logging_info['mse_none'] = advantages.pow(2).mean()
-    logging_info['mse_v'] = (advantages - gae_state_cv_values.data).pow(2).mean()
-    logging_info['mse_h0'] = (advantages - gae_state_h0_cv_values.data).pow(2).mean()
-    logging_info['mse_h1'] = (advantages - gae_state_h1_cv_values.data).pow(2).mean()
-    # logging_info['mse_q'] = (advantages - gae_state_action_cv_values.data).pow(2).mean()
+    for k, v in value_nets.items():
+      mse = (returns - v(Variable(states), discounted_time_left).data).pow(2).mean()
+      print('MSE returns - %s: %g' % (k, mse))
+      logging_info['mse_%s' % k] = mse
+
     # End debug printing
 
     action_means, action_log_stds, action_stds = policy_net(Variable(states))
     fixed_log_prob = normal_log_density(Variable(actions), action_means, action_log_stds, action_stds).data.clone()
 
-    def get_loss(volatile=False, baseline="none"):
+    def get_loss(volatile=False):
         action_means, action_log_stds, action_stds = policy_net(Variable(states, volatile=volatile))
         log_prob = normal_log_density(Variable(actions), action_means, action_log_stds, action_stds)
 
-        if baseline == "none":
-          action_loss = -Variable(advantages) * torch.exp(log_prob - Variable(fixed_log_prob))
-        elif baseline == "v":
-          action_loss = -(Variable(advantages) - gae_state_cv_values.detach()) * torch.exp(log_prob - Variable(fixed_log_prob))
-        elif baseline == "vh0":
-          action_loss = -(Variable(advantages) - gae_state_h0_cv_values.detach()) * torch.exp(log_prob - Variable(fixed_log_prob))
-        elif baseline == "vh1":
-          action_loss = -(Variable(advantages) - gae_state_h1_cv_values.detach()) * torch.exp(log_prob - Variable(fixed_log_prob))
-        elif baseline == "q":
-          current_policy_action = action_means + Variable(epsilons) * action_stds
-          current_policy_gae_state_action_cv_values = gae_state_action_cv_net(torch.cat(
-              (Variable(states), current_policy_action), dim=1))
-          action_loss = -((Variable(advantages) - gae_state_action_cv_values.detach()) * torch.exp(log_prob - Variable(fixed_log_prob))
-                          + current_policy_gae_state_action_cv_values)
-        else:
-          exit()
+        action_loss = -Variable(advantages) * torch.exp(log_prob - Variable(fixed_log_prob))
 
         return action_loss.mean()
-
 
     def get_kl():
         mean1, log_std1, std1 = policy_net(Variable(states))
@@ -245,27 +173,17 @@ def update_params(batch):
         kl = log_std1 - log_std0 + (std0.pow(2) + (mean0 - mean1).pow(2)) / (2.0 * std1.pow(2)) - 0.5
         return kl.sum(1, keepdim=True)
 
-    trpo_step(policy_net, functools.partial(get_loss, baseline=args.baseline), get_kl, args.max_kl, args.damping)
+    trpo_step(policy_net, get_loss, get_kl, args.max_kl, args.damping)
 
     # Update control variates
-    def update_cv(cv_net, cv_optim, inputs, targets, n_epochs=25):
-      if args.v_optimizer == 'lbfgs':
-        flat_params, _, opt_info = scipy.optimize.fmin_l_bfgs_b(get_cv_loss, get_flat_params_from(cv_net).double().numpy(), args=(cv_net, inputs, targets), maxiter=25) # Check that this does the right thing?
-        set_flat_params_to(cv_net, torch.Tensor(flat_params))
-      elif args.v_optimizer == 'adam':
-        for _ in range(n_epochs):
-          cv_net_values = cv_net(inputs)
-          cv_optim.zero_grad()
-          cv_loss = (targets - cv_net_values).pow(2).mean()
-          cv_loss.backward()
-          cv_optim.step()
+    def update_value(value_net):
+      flat_params, _, opt_info = scipy.optimize.fmin_l_bfgs_b(get_value_loss,
+                                                              get_flat_params_from(value_net).double().numpy(),
+                                                              args=(value_net,), maxiter=25)
+      set_flat_params_to(value_net, torch.Tensor(flat_params))
 
-    # update_cv(state_cv_net, state_cv_optim, Variable(states), targets - values.detach())
-    # update_cv(state_action_cv_net, state_action_cv_optim, Variable(torch.cat((states, actions), dim=1)), targets - values.detach())
-
-    update_cv(gae_state_cv_net, gae_state_cv_optim, Variable(states), advantage_targets)
-    update_cv(gae_state_h0_cv_net, gae_state_h0_cv_optim, Variable(time_states), advantage_targets)
-    update_cv(gae_state_h1_cv_net, gae_state_h1_cv_optim, Variable(states), advantage_targets)
+    for v in value_nets.values():
+      update_value(v)
 
     return logging_info
 

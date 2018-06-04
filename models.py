@@ -45,16 +45,27 @@ class Value(nn.Module):
           self.disc_avg_value_head.weight.data.mul_(0.1)
           self.disc_avg_value_head.bias.data.mul_(0.0)
 
-    def forward(self, x):
+    def forward(self, x, discounted_time_left):
         x = F.tanh(self.affine1(x))
         x = F.tanh(self.affine2(x))
 
         state_values = self.value_head(x)
         if self.disc_avg_v:
           disc_avg_state_values = self.disc_avg_value_head(x)
-          return state_values, disc_avg_state_values
+          return state_values + discounted_time_left * disc_avg_state_values
         else:
           return state_values
+
+
+class TimeValue(Value):
+    def __init__(self, num_inputs, disc_avg_v=False):
+        # Add 1 for time index
+        super(TimeValue, self).__init__(num_inputs + 1, disc_avg_v)
+
+    def forward(self, x, discounted_time_left):
+        time_states = torch.cat((x, discounted_time_left), 1)
+        return super(TimeValue, self).forward(time_states, discounted_time_left)
+
 
 class EnvModel(nn.Module):
     def __init__(self, num_inputs, num_outputs):

@@ -84,6 +84,8 @@ value_nets = {
 }
 value_net = value_nets[args.baseline]
 
+loss_grad_ema = 0.
+
 def select_action(state):
     state = torch.from_numpy(state).unsqueeze(0)
     action_mean, _, action_std = policy_net(Variable(state))
@@ -156,11 +158,11 @@ def update_params(batch):
     action_means, action_log_stds, action_stds = policy_net(Variable(states))
     fixed_log_prob = normal_log_density(Variable(actions), action_means, action_log_stds, action_stds).data.clone()
 
-    def get_loss(volatile=False):
+    def get_loss(volatile=False, advantages=Variable(advantages)):
         action_means, action_log_stds, action_stds = policy_net(Variable(states, volatile=volatile))
         log_prob = normal_log_density(Variable(actions), action_means, action_log_stds, action_stds)
 
-        action_loss = -Variable(advantages) * torch.exp(log_prob - Variable(fixed_log_prob))
+        action_loss = -advantages * torch.exp(log_prob - Variable(fixed_log_prob))
 
         return action_loss.mean()
 
@@ -175,7 +177,24 @@ def update_params(batch):
 
     trpo_step(policy_net, get_loss, get_kl, args.max_kl, args.damping)
 
-    # Update control variates
+    # Compute the gradient variances
+    for k, v in value_nets.items():
+      loss = get_loss(advantages=Variable(returns) - v(Variable(states), discounted_time_left))
+      grads = torch.autograd.grad(loss, policy_net.parameters())
+      loss_grad = torch.cat([grad.view(-1) for grad in grads]).data
+
+      # Update EMA
+      if k == 'v':
+        alpha = 0.99
+        global loss_grad_ema
+        loss_grad_ema = alpha * loss_grad_ema + (1 - alpha) * loss_grad
+
+      var_g = loss_grad.pow(2).mean() - loss_grad_ema.pow(2).mean()
+      print('Var %s: %g' % (k, var_g))
+      logging_info['var_%s' % k] = var_g
+
+
+    # Update control variates (after policy update)
     def update_value(value_net):
       flat_params, _, opt_info = scipy.optimize.fmin_l_bfgs_b(get_value_loss,
                                                               get_flat_params_from(value_net).double().numpy(),

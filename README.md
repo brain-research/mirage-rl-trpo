@@ -32,3 +32,16 @@ More or less similar to the original code. Coming soon.
 
 - [ ] Plots.
 - [ ] Collect data in multiple threads.
+
+
+
+
+## TO RUN HORIZON-AWARE EXPERIMENTS:
+
+Copy the files over
+Run the run-mirageX.sh files on the right machines
+Make a new tmp_logs/ folder
+Copy logs over to the local folder
+Run run_disc.py to make the plots
+
+

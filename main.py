@@ -19,6 +19,10 @@ import json
 import os
 import pickle
 
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
 torch.utils.backcompat.broadcast_warning.enabled = True
 torch.utils.backcompat.keepdim_warning.enabled = True
 
@@ -165,14 +169,19 @@ def update_params(batch):
     #
     # Print debugging values
     #
+    plt.figure()
+    plt.scatter(returns.numpy(), values.data.numpy(), alpha=0.1)
+    plt.savefig('values.png')
+
     print('Mean advantages: %g' % (advantages.mean()))
     print('MSE returns: %g' % (returns.pow(2).mean()))
+    print('VAR returns: %g' % (returns.numpy().var(ddof=1)))
     print('MSE returns - values: %g' % ((returns - values.data).pow(2).mean()))
     print('MSE returns - state CV: %g' % ((returns - values.data - state_cv_values.data).pow(2).mean()))
     print('MSE returns - state-action CV: %g' % ((returns - values.data - state_action_cv_values.data).pow(2).mean()))
     print('MSE advantages: %g' % (advantages.pow(2).mean()))
     print('MSE advantages - state CV: %g' % ((advantages - gae_state_cv_values.data).pow(2).mean()))
-    print('MSE advanatages - state-action CV: %g' % ((advantages - gae_state_action_cv_values.data).pow(2).mean()))
+    print('MSE advantages - state-action CV: %g' % ((advantages - gae_state_action_cv_values.data).pow(2).mean()))
 
     logging_info['mse_v_lbfgs'] = (returns - values.data).pow(2).mean()
     logging_info['mse_none'] = advantages.pow(2).mean()

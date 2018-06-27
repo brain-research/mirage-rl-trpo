@@ -24,14 +24,18 @@
 #    >> logs/variance/halfcheetah_2_16_disc_value.txt
 #done
 
-for I in `seq 0 100 999` 995
+DATE=2_23
+for CHKPT in halfcheetah_${DATE}_normal_value humanoid_${DATE}_normal_value halfcheetah_${DATE}_disc_value humanoid_${DATE}_disc_value
 do
-  python calc_variance.py \
-    --checkpoint-dir chkpts/humanoid_2_16_disc_value \
-    --checkpoint $I \
-    --n-epochs 40 \
-    --n-samples 50 \
-    >> logs/variance/humanoid_2_16_disc_value.txt
+  for I in `seq 0 100 999` 995
+  do
+    python calc_variance.py \
+      --checkpoint-dir chkpts/$CHKPT \
+      --checkpoint $I \
+      --n-epochs 40 \
+      --n-samples 50 \
+      >> logs/variance/$CHKPT.txt
+  done
 done
 
 

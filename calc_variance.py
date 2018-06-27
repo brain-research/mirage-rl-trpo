@@ -109,6 +109,7 @@ def grad_log_pi(state, action):
 
 def compute_estimators(q_x, q_y, q, v_x, v_y, value_func_est, q_func_est, q_func_est_prime,
                        shared_grad_log_pi, unshared_grad_log_pi):
+  ipdb.set_trace()
   sq_shared_grad_log_pi = shared_grad_log_pi * shared_grad_log_pi
   term_1 = np.mean(q_x*q_x*sq_shared_grad_log_pi + q_y*q_y*sq_shared_grad_log_pi)/2
   term_2 = np.mean(q_x*q_y*sq_shared_grad_log_pi)

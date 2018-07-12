@@ -1,6 +1,7 @@
 MIT License
 
 Copyright (c) 2017 Ilya Kostrikov
+
 Copyright 2018 Google LLC
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
